@@ -299,14 +299,15 @@ read가 짧다면 100bp까지 늘려도 됩니다.
 명령줄에서 바로 지정하고 싶으면 (non-interactive) `--edge-margin 50`
 옵션을 줄 수도 있습니다.
 
-### 대용량 실데이터 성능 설정 (`max_reads`, `mpileup_max_depth`)
+### 대용량 실데이터 성능 설정 (`target_depth`, `mpileup_max_depth`)
 
 5-10 kb 플라스미드에 MinION barcode 하나가 수만~수십만 read를 주면 depth가
 수만×가 되고, merge → QC → mapping → `samtools consensus` 단계가 read 수에
 비례해 느려집니다. 이를 위해 다음을 적용했습니다.
 
-- `max_reads` (기본 5000, 0 = 전체): QC를 통과한 read를 앞에서부터 이 개수까지만
-  매핑합니다. 필터가 필요한 개수를 채우는 즉시 멈추므로 전체 run을 다 읽지 않습니다.
+- `target_depth` (기본 100, 0 = 전체): QC를 통과한 read를 앞에서부터 모아 총 염기 수가
+  `target_depth × reference 길이`에 도달하면 멈춥니다. 전체 run을 다 읽지 않습니다.
+- `threads` 기본값은 16입니다 (UI에서는 PC 코어 수를 넘지 않게 자동 제한).
   QC를 끄면 `<sample>.subsampled.fastq.gz`, 켜면 `<sample>.filtered.fastq.gz`에
   상한이 적용된 read가 저장됩니다.
 - Merge: `.fastq.gz`는 압축 해제/재압축 없이 그대로 이어 붙입니다.

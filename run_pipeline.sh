@@ -67,7 +67,7 @@ REF_ROOT="$(resolve_cfg_path "$(read_cfg references_dir references)")"
 DATA_ROOT="$(resolve_cfg_path "$(read_cfg data_dir data)")"
 RESULTS_ROOT="$(resolve_cfg_path "$(read_cfg results_dir results)")"
 PRESET="$(read_cfg minimap2_preset map-ont)"
-THREADS="$(read_cfg threads 4)"
+THREADS="$(read_cfg threads 16)"
 MIN_LEN="$(read_cfg min_read_length 0)"
 MIN_QUAL="$(read_cfg min_read_quality 0)"
 VARIANT_CALLER="$(read_cfg variant_caller bcftools)"
@@ -81,11 +81,12 @@ PILON_MEM="$(read_cfg pilon_mem 16G)"
 RUN_TIMESTAMP="$(date +%y%m%d_%H%M)"
 
 # Large-run performance settings.
-#   max_reads           : keep at most this many reads per sample for mapping
-#                         (0 = use every read). Plasmid checks need only a few
-#                         hundred-fold depth; 5000 reads is usually >1000x.
+#   target_depth        : stop collecting QC-passing reads once their total
+#                         bases reach target_depth x reference length
+#                         (0 = use every read). 100x is enough for plasmid
+#                         SNP/indel checks and keeps real MinION runs fast.
 #   mpileup_max_depth   : per-position read cap for bcftools mpileup.
-MAX_READS="$(read_cfg max_reads 5000)"
+TARGET_DEPTH="$(read_cfg target_depth 100)"
 MPILEUP_MAX_DEPTH="$(read_cfg mpileup_max_depth 1000)"
 
 # ONT-friendly bcftools mpileup options.
@@ -127,7 +128,7 @@ echo "   references  : $REF_ROOT"
 echo "   data        : $DATA_ROOT"
 echo "   results     : $RESULTS_ROOT"
 echo "   preset      : $PRESET   threads/sample: $THREADS   parallel samples: $PARALLEL_JOBS"
-echo "   max reads   : $MAX_READS (0 = all)   mpileup depth cap: $MPILEUP_MAX_DEPTH"
+echo "   target depth: ${TARGET_DEPTH}x (0 = all)   mpileup depth cap: $MPILEUP_MAX_DEPTH"
 echo "   bcftools    : $BCFTOOLS_PLATFORM_OPT   filter: ${READ_FILTER_TOOL:-none}   compress: $FAST_GZIP"
 echo "==================================================================="
 
@@ -299,17 +300,22 @@ process_one() {
         echo "$LOG [1/6] Merged reads already exist, skipping"
     fi
 
-    # 2. Optional QC filtering (chopper > NanoFilt) and read cap (max_reads).
-    #    With max_reads > 0 the stream stops as soon as enough passing reads
+    # 2. Optional QC filtering (chopper > NanoFilt) and depth cap (target_depth).
+    #    With target_depth > 0 the stream stops as soon as enough passing bases
     #    were collected, so the filter never has to scan the whole run.
     #    `|| true` inside the subshell absorbs the SIGPIPE that zcat/filter
     #    receive when `head` closes early (otherwise pipefail aborts).
     local READS_FOR_MAPPING="$MERGED_FASTQ"
     local CAP_CMD=(cat)
     local CAP_NOTE="all reads"
-    if [[ "$MAX_READS" -gt 0 ]]; then
-        CAP_CMD=(head -n "$((MAX_READS * 4))")
-        CAP_NOTE="first $MAX_READS passing reads"
+    if [[ "$TARGET_DEPTH" -gt 0 ]]; then
+        local REF_LEN
+        REF_LEN="$(grep -v '^>' "$REF_PATH" | tr -d ' \t\r\n' | wc -c)"
+        local TARGET_BASES=$(( TARGET_DEPTH * REF_LEN ))
+        # Pass whole FASTQ records until the summed read length reaches
+        # TARGET_BASES, then stop reading (upstream gets SIGPIPE).
+        CAP_CMD=(awk -v max="$TARGET_BASES" '{ print } NR % 4 == 2 { bases += length($0) } NR % 4 == 0 && bases >= max { exit }')
+        CAP_NOTE="~${TARGET_DEPTH}x (${TARGET_BASES} bases)"
     fi
     run_filter() {
         if [[ "$READ_FILTER_TOOL" == "chopper" ]]; then
@@ -330,9 +336,9 @@ process_one() {
         else
             echo "$LOG [2/6] QC filtering disabled"
         fi
-        if [[ "$MAX_READS" -gt 0 ]]; then
+        if [[ "$TARGET_DEPTH" -gt 0 ]]; then
             local SUBSAMPLED_FASTQ="$SAMPLE_DIR/${REF_NAME}.subsampled.fastq.gz"
-            echo "$LOG [2/6] Read cap: $CAP_NOTE -> $(basename "$SUBSAMPLED_FASTQ")"
+            echo "$LOG [2/6] Depth cap: $CAP_NOTE -> $(basename "$SUBSAMPLED_FASTQ")"
             ( zcat "$MERGED_FASTQ" 2>/dev/null || true ) \
                 | "${CAP_CMD[@]}" | $FAST_GZIP > "$SUBSAMPLED_FASTQ"
             READS_FOR_MAPPING="$SUBSAMPLED_FASTQ"
@@ -471,7 +477,7 @@ echo "==================================================================="
 echo " Running $JOB_COUNT sample(s), $PARALLEL_JOBS at a time"
 echo "==================================================================="
 
-export DATA_ROOT RESULTS_ROOT PRESET THREADS MIN_LEN MIN_QUAL VARIANT_CALLER BCFTOOLS_PLATFORM_OPT PILON_JAR PILON_MEM RUN_TIMESTAMP MAX_READS MPILEUP_MAX_DEPTH FAST_GZIP READ_FILTER_TOOL
+export DATA_ROOT RESULTS_ROOT PRESET THREADS MIN_LEN MIN_QUAL VARIANT_CALLER BCFTOOLS_PLATFORM_OPT PILON_JAR PILON_MEM RUN_TIMESTAMP TARGET_DEPTH MPILEUP_MAX_DEPTH FAST_GZIP READ_FILTER_TOOL
 export -f process_one
 
 if [[ "$JOB_COUNT" -gt 0 ]]; then

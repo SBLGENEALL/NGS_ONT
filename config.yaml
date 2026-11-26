@@ -21,7 +21,7 @@ results_dir: results
 minimap2_preset: map-ont
 
 # Number of threads to use for minimap2 / samtools, PER SAMPLE
-threads: 4
+threads: 16
 
 # Number of samples (reference fastas) to process at the same time.
 # Each sample uses up to "threads" CPU cores, so on a high-core
@@ -48,11 +48,11 @@ pilon_jar: ""
 pilon_mem: 16G
 
 # ---- Large-run performance -------------------------------------------------
-# Keep at most this many QC-passing reads per sample for mapping/variant
-# calling (0 = use every read). For a 5-10 kb plasmid, 5000 reads is
-# usually well above 500x depth, which is plenty for SNP/indel calls and
+# Target coverage per sample: QC-passing reads are collected until their
+# total bases reach target_depth x reference length, then reading stops
+# (0 = use every read). 100x is plenty for plasmid SNP/indel calls and
 # keeps real MinION runs from taking hours.
-max_reads: 5000
+target_depth: 100
 
 # Per-position read cap for bcftools mpileup (-d).
 mpileup_max_depth: 1000
