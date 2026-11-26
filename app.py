@@ -65,9 +65,9 @@ except ValueError:
 DEFAULT_ANALYSIS_SETTINGS: dict[str, dict[str, object]] = {
     "Batch analysis": {
         "experiment_name": "ONT_plasmid_batch",
-        "threads": 8,
+        "threads": BatchSettings.threads,
         "parallel_jobs": 16,
-        "screening_depth": 0,
+        "screening_depth": BatchSettings.screening_depth,
         "min_length": 500,
         "min_quality": 10,
         "min_variant_quality": 20.0,
@@ -1216,7 +1216,7 @@ def _batch_ont_tab(settings: dict[str, object]) -> None:
                 experiment_name=project_name,
                 threads=int(settings["threads"]),
                 parallel_jobs=int(settings["parallel_jobs"]),
-                screening_depth=int(settings.get("screening_depth", 0)),
+                screening_depth=int(settings.get("screening_depth", BatchSettings.screening_depth)),
                 min_read_length=int(settings["min_length"]),
                 min_read_quality=int(settings["min_quality"]),
                 min_variant_quality=float(settings.get("min_variant_quality", 20.0)),
@@ -1448,7 +1448,7 @@ def _settings_page() -> None:
                 min_value=1,
                 max_value=64,
                 value=int(current["threads"]),
-                help="ONT sample 하나에 사용할 CPU threads입니다. 기본값은 8입니다.",
+                help="ONT sample 하나에 사용할 CPU threads입니다. 기본값은 16입니다.",
             )
             updated["parallel_jobs"] = st.number_input(
                 "Parallel samples",
@@ -1460,7 +1460,7 @@ def _settings_page() -> None:
             updated["screening_depth"] = st.number_input(
                 "Screening depth (×, 0 = all reads)",
                 min_value=0,
-                value=int(current.get("screening_depth", 0)),
+                value=int(current.get("screening_depth", BatchSettings.screening_depth)),
                 step=100,
                 help="0은 전체 분석입니다. 양수는 QC 통과 reads에서 무작위로 뽑을 목표 입력량(×)입니다. "
                      "실제 매핑 depth는 달라질 수 있고, 저빈도 변이 검출력이 낮아질 수 있습니다.",

@@ -161,7 +161,7 @@ def server_fastq_uploads(value: str) -> list[ServerPathUpload]:
 @dataclass(frozen=True)
 class BatchSettings:
     experiment_name: str
-    threads: int = 8
+    threads: int = 16
     parallel_jobs: int = 16
     min_read_length: int = 500
     min_read_quality: int = 10
@@ -170,7 +170,7 @@ class BatchSettings:
     min_allele_fraction: float = 0.80
     circular: bool = True
     edge_margin: int = 50
-    screening_depth: int = 0
+    screening_depth: int = 100
 
 
 @dataclass(frozen=True)
