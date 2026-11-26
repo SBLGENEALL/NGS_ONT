@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ont_ui.fastq_qc import load_fastq_qc, summarize_fastq
+from ont_ui.fastq_qc import load_fastq_qc, sample_for_mapping, summarize_fastq
 
 
 class FastqQcTests(unittest.TestCase):
@@ -27,6 +27,22 @@ class FastqQcTests(unittest.TestCase):
             self.assertAlmostEqual(result["q10_read_fraction"], 1.0)
             self.assertAlmostEqual(result["q20_read_fraction"], 2 / 3)
             self.assertAlmostEqual(result["q30_read_fraction"], 1 / 3)
+
+    def test_screening_selects_reproducibly_and_skips_low_depth(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "input.fastq"
+            source.write_text("".join(f"@{i}\nACGT\n+\nIIII\n" for i in range(100)))
+            metrics = summarize_fastq(source)
+            output = Path(tmp) / "sample.fastq.gz"
+            self.assertFalse(sample_for_mapping(source, output, metrics, 500)["sampled"])
+            self.assertFalse(output.exists())
+            summary = sample_for_mapping(source, output, metrics, 80)
+            self.assertEqual(summary["selected_reads"], 20)
+            self.assertEqual(summary["selected_bases"], 80)
+            first = gzip.decompress(output.read_bytes())
+            self.assertEqual(summarize_fastq(output)["reads"], 20)
+            sample_for_mapping(source, output, metrics, 80)
+            self.assertEqual(first, gzip.decompress(output.read_bytes()))
 
     def test_load_fastq_qc_returns_empty_dict_for_invalid_or_missing_file(self):
         with tempfile.TemporaryDirectory() as tmp:

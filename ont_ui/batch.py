@@ -170,6 +170,7 @@ class BatchSettings:
     min_allele_fraction: float = 0.80
     circular: bool = True
     edge_margin: int = 50
+    screening_depth: int = 0
 
 
 @dataclass(frozen=True)
@@ -312,6 +313,7 @@ def _write_config(path: Path, job: BatchJob, settings: BatchSettings) -> None:
         ("parallel_jobs", max(1, min(64, settings.parallel_jobs))),
         ("min_read_length", max(0, settings.min_read_length)),
         ("min_read_quality", max(0, settings.min_read_quality)),
+        ("screening_depth", max(0, settings.screening_depth)),
         ("variant_caller", "bcftools"),
         ("pilon_jar", ""),
         ("pilon_mem", "16G"),
@@ -439,6 +441,7 @@ def prepare_batch_job(
                     "edge_margin": settings.edge_margin if settings.circular else 0,
                 },
                 "pipeline_settings": {
+                    "screening_depth": settings.screening_depth,
                     "min_read_length": settings.min_read_length,
                     "min_read_quality": settings.min_read_quality,
                 },

@@ -70,6 +70,7 @@ PRESET="$(read_cfg minimap2_preset map-ont)"
 THREADS="$(read_cfg threads 4)"
 MIN_LEN="$(read_cfg min_read_length 0)"
 MIN_QUAL="$(read_cfg min_read_quality 0)"
+SCREENING_DEPTH="$(read_cfg screening_depth 0)"
 VARIANT_CALLER="$(read_cfg variant_caller bcftools)"
 PARALLEL_JOBS="$(read_cfg parallel_jobs 1)"
 PILON_JAR="$(read_cfg pilon_jar "")"
@@ -256,16 +257,16 @@ process_one() {
     local MERGED_FASTQ="$SAMPLE_DIR/${REF_NAME}.merged.fastq.gz"
     if [[ ! -s "$MERGED_FASTQ" ]]; then
         echo "$LOG [1/6] Merging ${#FASTQ_FILES[@]} read file(s) -> $(basename "$MERGED_FASTQ")"
-        : > "${MERGED_FASTQ%.gz}.tmp"
+        local merged_tmp
+        merged_tmp=$(mktemp "$SAMPLE_DIR/.merged.XXXXXXXX")
         for f in "${FASTQ_FILES[@]}"; do
-            if [[ "$f" == *.gz ]]; then
-                zcat "$f" >> "${MERGED_FASTQ%.gz}.tmp"
+            if [[ "${f,,}" == *.gz ]]; then
+                cat -- "$f"
             else
-                cat "$f" >> "${MERGED_FASTQ%.gz}.tmp"
+                gzip -1c -- "$f"
             fi
-        done
-        gzip -c "${MERGED_FASTQ%.gz}.tmp" > "$MERGED_FASTQ"
-        rm -f "${MERGED_FASTQ%.gz}.tmp"
+        done > "$merged_tmp"
+        mv -- "$merged_tmp" "$MERGED_FASTQ"
     else
         echo "$LOG [1/6] Merged reads already exist, skipping"
     fi
@@ -277,7 +278,7 @@ process_one() {
         if command -v NanoFilt >/dev/null 2>&1; then
             FILTERED_FASTQ="$SAMPLE_DIR/${REF_NAME}.filtered.fastq.gz"
             echo "$LOG [2/6] QC filtering (length>=$MIN_LEN, quality>=$MIN_QUAL) -> $(basename "$FILTERED_FASTQ")"
-            zcat "$MERGED_FASTQ" | NanoFilt -l "$MIN_LEN" -q "$MIN_QUAL" | gzip > "$FILTERED_FASTQ"
+            zcat "$MERGED_FASTQ" | NanoFilt -l "$MIN_LEN" -q "$MIN_QUAL" | gzip -1 > "$FILTERED_FASTQ"
             READS_FOR_MAPPING="$FILTERED_FASTQ"
         else
             echo "$LOG [2/6] WARNING: NanoFilt not found; requested QC filtering was skipped" >&2
@@ -296,9 +297,28 @@ process_one() {
     if [[ -n "$FILTERED_FASTQ" && -s "$FILTERED_FASTQ" ]]; then
         FASTQ_QC_ARGS+=(--filtered "$FILTERED_FASTQ")
     fi
+    local sampled_tmp="" reference_bases
+    if (( SCREENING_DEPTH > 0 )); then
+        reference_bases=$(awk '!/^>/{gsub(/[[:space:]]/, ""); n+=length} END{print n+0}' "$REF_PATH")
+        sampled_tmp=$(mktemp "$SAMPLE_DIR/.screening.XXXXXXXX")
+        FASTQ_QC_ARGS+=(--target-bases "$(( SCREENING_DEPTH * reference_bases ))" --sample-out "$sampled_tmp")
+    fi
     if python "$SCRIPT_DIR/ont_ui/fastq_qc.py" "${FASTQ_QC_ARGS[@]}"; then
+        if [[ -n "$sampled_tmp" ]]; then
+            if [[ -s "$sampled_tmp" ]]; then
+                READS_FOR_MAPPING="$SAMPLE_DIR/${REF_NAME}.screening.fastq.gz"
+                mv -- "$sampled_tmp" "$READS_FOR_MAPPING"
+            else
+                rm -f -- "$sampled_tmp"
+            fi
+        fi
         echo "$LOG [2/6] Read QC summary -> $(basename "$FASTQ_QC_JSON")"
     else
+        if (( SCREENING_DEPTH > 0 )); then
+            rm -f -- "$sampled_tmp"
+            echo "$LOG [ERROR] Cannot prepare screening input" >&2
+            return 1
+        fi
         echo "$LOG [2/6] WARNING: Read QC summary could not be generated" >&2
     fi
 
@@ -384,6 +404,9 @@ process_one() {
         echo ""
         echo "- Experiment: $EXP_NAME"
         echo "- Reference: $REF_FILE"
+        if (( SCREENING_DEPTH > 0 )); then
+            echo "- Screening target input depth: ${SCREENING_DEPTH}x; mapping input counts: ${REF_NAME}.fastq_qc.json"
+        fi
         echo "- Mapping: $MAPPED"
         echo "- Mean depth: ${MEAN_DEPTH}x"
         echo "- Final consensus for SnapGene: ${REF_NAME}.consensus.fasta"
@@ -435,13 +458,14 @@ echo "==================================================================="
 echo " Running $JOB_COUNT sample(s), $PARALLEL_JOBS at a time"
 echo "==================================================================="
 
-export SCRIPT_DIR DATA_ROOT RESULTS_ROOT PRESET THREADS MIN_LEN MIN_QUAL VARIANT_CALLER BCFTOOLS_PLATFORM_MODE PILON_JAR PILON_MEM RUN_TIMESTAMP
+export SCRIPT_DIR DATA_ROOT SCREENING_DEPTH RESULTS_ROOT PRESET THREADS MIN_LEN MIN_QUAL VARIANT_CALLER BCFTOOLS_PLATFORM_MODE PILON_JAR PILON_MEM RUN_TIMESTAMP
 export -f process_one
 
 if [[ "$JOB_COUNT" -gt 0 ]]; then
     if ! xargs -0 -n2 -P "$PARALLEL_JOBS" bash -c 'process_one "$1" "$2"' _ < "$JOBLIST"; then
         echo "" >&2
         echo "WARNING: one or more samples failed - see [SKIP]/error messages above" >&2
+        exit 1
     fi
 fi
 

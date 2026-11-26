@@ -67,6 +67,7 @@ DEFAULT_ANALYSIS_SETTINGS: dict[str, dict[str, object]] = {
         "experiment_name": "ONT_plasmid_batch",
         "threads": 8,
         "parallel_jobs": 16,
+        "screening_depth": 0,
         "min_length": 500,
         "min_quality": 10,
         "min_variant_quality": 20.0,
@@ -548,6 +549,12 @@ def _sample_stage_rows(
         if filtered.is_file()
         else ("NanoFilt 미적용" if qc_requested else "QC filter 비활성화")
     )
+    screening = qc_summary.get("screening")
+    screening_note = ""
+    if isinstance(screening, dict) and screening.get("sampled"):
+        screening_note = (
+            f"Screening {screening['selected_reads']:,}/{screening['available_reads']:,} reads · "
+        )
     source = str(sample.get("variant_source", "bcftools"))
     return [
         {
@@ -576,7 +583,7 @@ def _sample_stage_rows(
             if all(path.is_file() for path in (bam, bai, flagstat, depth))
             else "❌ Incomplete",
             "핵심 결과": (
-                f"{int(sample.get('total_reads', 0) or 0):,} reads · "
+                f"{screening_note}{int(sample.get('total_reads', 0) or 0):,} reads · "
                 f"Mapping {float(sample['mapping_rate']):.1%} · "
                 f"Mean depth {float(sample.get('mean_depth', 0)):.1f}× · "
                 f"Coverage ≥10× {float(sample.get('coverage_10x', 0)):.1%}"
@@ -1209,6 +1216,7 @@ def _batch_ont_tab(settings: dict[str, object]) -> None:
                 experiment_name=project_name,
                 threads=int(settings["threads"]),
                 parallel_jobs=int(settings["parallel_jobs"]),
+                screening_depth=int(settings.get("screening_depth", 0)),
                 min_read_length=int(settings["min_length"]),
                 min_read_quality=int(settings["min_quality"]),
                 min_variant_quality=float(settings.get("min_variant_quality", 20.0)),
@@ -1448,6 +1456,14 @@ def _settings_page() -> None:
                 max_value=64,
                 value=int(current["parallel_jobs"]),
                 help="동시에 처리할 ONT sample의 최대 개수입니다.",
+            )
+            updated["screening_depth"] = st.number_input(
+                "Screening depth (×, 0 = all reads)",
+                min_value=0,
+                value=int(current.get("screening_depth", 0)),
+                step=100,
+                help="0은 전체 분석입니다. 양수는 QC 통과 reads에서 무작위로 뽑을 목표 입력량(×)입니다. "
+                     "실제 매핑 depth는 달라질 수 있고, 저빈도 변이 검출력이 낮아질 수 있습니다.",
             )
             updated["min_length"] = st.number_input(
                 "Minimum read length",

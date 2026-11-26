@@ -6,6 +6,8 @@ import argparse
 import gzip
 import json
 import math
+import random
+from functools import lru_cache
 from collections import Counter
 from pathlib import Path
 from typing import TextIO
@@ -27,6 +29,11 @@ def _n50(length_counts: Counter[int], total_bases: int) -> int:
     return 0
 
 
+@lru_cache(maxsize=128)
+def _error_probability(char: str) -> float:
+    return 10 ** (-max(0, ord(char) - 33) / 10)
+
+
 def summarize_fastq(path: Path) -> dict[str, int | float]:
     """Return read-level length and mean-Q metrics without loading reads in memory."""
     path = path.expanduser().resolve()
@@ -46,10 +53,7 @@ def summarize_fastq(path: Path) -> dict[str, int | float]:
             if not sequence or not separator or len(sequence) != len(quality):
                 raise ValueError(f"Malformed FASTQ record in {path.name} near read {reads + 1}")
 
-            phred_scores = [max(0, ord(char) - 33) for char in quality]
-            mean_error_probability = sum(10 ** (-score / 10) for score in phred_scores) / len(
-                phred_scores
-            )
+            mean_error_probability = sum(map(_error_probability, quality)) / len(quality)
             read_quality = -10 * math.log10(mean_error_probability)
             length = len(sequence)
             reads += 1
@@ -82,11 +86,43 @@ def load_fastq_qc(path: Path) -> dict[str, object]:
     return data if isinstance(data, dict) else {}
 
 
+def sample_for_mapping(source: Path, output: Path, metrics: dict, target_bases: int) -> dict:
+    """Uniform selection of whole records, preserving input order and using bounded memory."""
+    reads = int(metrics["reads"])
+    bases = int(metrics["total_bases"])
+    if not reads or not bases:
+        raise ValueError("No usable FASTQ reads for screening")
+    # Convert desired input bases to a read count using the actual mean read length.
+    count = min(reads, max(1, (target_bases * reads + bases - 1) // bases))
+    summary = {"available_reads": reads, "selected_reads": count, "selected_bases": bases,
+               "target_bases": target_bases, "sampled": count < reads, "seed": 42}
+    if count == reads:
+        return summary
+    rng = random.Random(42)
+    needed = count
+    selected_bases = 0
+    with _open_fastq(source) as handle, gzip.open(output, "wt", compresslevel=1) as out:
+        for remaining in range(reads, 0, -1):
+            header, seq, plus, quality = (handle.readline() for _ in range(4))
+            if not quality:
+                raise ValueError("FASTQ changed since QC")
+            if rng.randrange(remaining) < needed:
+                out.writelines((header, seq, plus, quality))
+                selected_bases += len(seq.rstrip("\r\n"))
+                needed -= 1
+                if not needed:
+                    break
+    summary["selected_bases"] = selected_bases
+    return summary
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Write compact FASTQ QC metrics as JSON.")
     parser.add_argument("--merged", required=True, type=Path)
     parser.add_argument("--filtered", type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--target-bases", type=int, default=0)
+    parser.add_argument("--sample-out", type=Path)
     args = parser.parse_args()
 
     payload: dict[str, object] = {"merged": summarize_fastq(args.merged)}
@@ -94,6 +130,13 @@ def main() -> None:
         payload["filtered"] = summarize_fastq(args.filtered)
     else:
         payload["filtered"] = None
+    if args.target_bases > 0:
+        if args.sample_out is None:
+            parser.error("--target-bases requires --sample-out")
+        source = args.filtered if payload["filtered"] is not None else args.merged
+        metrics = payload["filtered"] or payload["merged"]
+        payload["screening"] = sample_for_mapping(source, args.sample_out, metrics, args.target_bases)
+        print("Mapping input:", json.dumps(payload["screening"]))
     args.output.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
