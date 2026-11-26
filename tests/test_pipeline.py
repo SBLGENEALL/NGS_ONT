@@ -43,6 +43,8 @@ class PipelineStagingTests(unittest.TestCase):
             self.assertIn(str(job.references_root.resolve()), config)
             self.assertIn("min_read_length: 500", config)
             self.assertIn("min_read_quality: 10", config)
+            self.assertIn("max_reads: 5000", config)
+            self.assertIn("mpileup_max_depth: 1000", config)
 
     def test_prepare_uploaded_read(self):
         with tempfile.TemporaryDirectory() as tmp:

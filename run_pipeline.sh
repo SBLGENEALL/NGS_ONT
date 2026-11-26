@@ -80,10 +80,45 @@ PILON_MEM="$(read_cfg pilon_mem 16G)"
 
 RUN_TIMESTAMP="$(date +%y%m%d_%H%M)"
 
-# bcftools mpileup supports a "-X ont" config preset in newer versions.
-BCFTOOLS_PLATFORM_OPT=""
-if command -v bcftools >/dev/null 2>&1 && bcftools mpileup 2>&1 | grep -qE -- '-X|--config'; then
-    BCFTOOLS_PLATFORM_OPT="-X ont"
+# Large-run performance settings.
+#   max_reads           : keep at most this many reads per sample for mapping
+#                         (0 = use every read). Plasmid checks need only a few
+#                         hundred-fold depth; 5000 reads is usually >1000x.
+#   mpileup_max_depth   : per-position read cap for bcftools mpileup.
+MAX_READS="$(read_cfg max_reads 5000)"
+MPILEUP_MAX_DEPTH="$(read_cfg mpileup_max_depth 1000)"
+
+# ONT-friendly bcftools mpileup options.
+#   -B             : disable BAQ. BAQ on long, deep ONT reads is the main
+#                    reason variant calling never finishes.
+#   -Q5 --max-BQ 30: same base-quality handling as the "-X ont" preset.
+# The "-X ont" preset itself is NOT used because it also adds -I (skip
+# indels), and this pipeline must report insertions/deletions.
+# NOTE: the old check (`bcftools mpileup 2>&1 | grep -q ...`) was always
+# false under `set -o pipefail`, because bcftools exits 1 after printing its
+# usage, so no ONT options were ever applied.
+BCFTOOLS_PLATFORM_OPT="-B -Q5"
+if command -v bcftools >/dev/null 2>&1; then
+    BCFTOOLS_USAGE="$(bcftools mpileup 2>&1 || true)"
+    if grep -q -- '--max-BQ' <<< "$BCFTOOLS_USAGE"; then
+        BCFTOOLS_PLATFORM_OPT="-B -Q5 --max-BQ 30"
+    fi
+fi
+
+# Fast compression: pigz (multi-threaded) when available, otherwise gzip -1.
+if command -v pigz >/dev/null 2>&1; then
+    FAST_GZIP="pigz -1 -p $THREADS"
+else
+    FAST_GZIP="gzip -1"
+fi
+
+# Read QC filter: chopper (Rust, multi-threaded) is much faster than NanoFilt.
+if command -v chopper >/dev/null 2>&1; then
+    READ_FILTER_TOOL="chopper"
+elif command -v NanoFilt >/dev/null 2>&1; then
+    READ_FILTER_TOOL="NanoFilt"
+else
+    READ_FILTER_TOOL=""
 fi
 
 echo "==================================================================="
@@ -92,6 +127,8 @@ echo "   references  : $REF_ROOT"
 echo "   data        : $DATA_ROOT"
 echo "   results     : $RESULTS_ROOT"
 echo "   preset      : $PRESET   threads/sample: $THREADS   parallel samples: $PARALLEL_JOBS"
+echo "   max reads   : $MAX_READS (0 = all)   mpileup depth cap: $MPILEUP_MAX_DEPTH"
+echo "   bcftools    : $BCFTOOLS_PLATFORM_OPT   filter: ${READ_FILTER_TOOL:-none}   compress: $FAST_GZIP"
 echo "==================================================================="
 
 mkdir -p "$RESULTS_ROOT"
@@ -175,6 +212,8 @@ process_one() {
         REF_NAMES+=("${rf%.*}")
     done
 
+    # find -L: the UI stages server FASTQ files as symbolic links, which a
+    # plain `find -type f` silently skips.
     local READ_FIND_EXPR=( -type f \( -iname "*.fastq.gz" -o -iname "*.fastq" -o -iname "*.fq.gz" -o -iname "*.fq" -o -iname "*.gz" \) )
 
     strip_read_ext() {
@@ -198,21 +237,21 @@ process_one() {
         if [[ "$is_ref_dir" == false && "$is_ref_file" == false && ! "$top" =~ ^[Bb]arcode0*[0-9]+$ ]]; then
             SHARED_FASTQ+=("$f")
         fi
-    done < <(find "$DATA_EXP_DIR" "${READ_FIND_EXPR[@]}" -print0)
+    done < <(find -L "$DATA_EXP_DIR" "${READ_FIND_EXPR[@]}" -print0)
 
     local FASTQ_FILES=()
     while IFS= read -r -d '' f; do
         if [[ "$(strip_read_ext "$(basename "$f")")" == "$REF_NAME" ]]; then
             FASTQ_FILES+=("$f")
         fi
-    done < <(find "$DATA_EXP_DIR" "${READ_FIND_EXPR[@]}" -print0)
+    done < <(find -L "$DATA_EXP_DIR" "${READ_FIND_EXPR[@]}" -print0)
 
     local REF_SUBDIR="$DATA_EXP_DIR/$REF_NAME"
     if [[ ${#FASTQ_FILES[@]} -gt 0 ]]; then
         echo "$LOG Reads: ${#FASTQ_FILES[@]} file(s) matched by filename '$REF_NAME.*'"
     elif [[ -d "$REF_SUBDIR" ]]; then
         while IFS= read -r -d '' f; do FASTQ_FILES+=("$f"); done \
-            < <(find "$REF_SUBDIR" "${READ_FIND_EXPR[@]}" -print0)
+            < <(find -L "$REF_SUBDIR" "${READ_FIND_EXPR[@]}" -print0)
         echo "$LOG Reads: ${#FASTQ_FILES[@]} file(s) from $(basename "$REF_SUBDIR")/ (matched by name)"
     elif [[ "$REF_NAME" =~ ^0*([0-9]+)[^0-9] ]]; then
         local REF_NUM="${BASH_REMATCH[1]}" BARCODE_SUBDIR="" d dname
@@ -225,7 +264,7 @@ process_one() {
         done
         if [[ -n "$BARCODE_SUBDIR" ]]; then
             while IFS= read -r -d '' f; do FASTQ_FILES+=("$f"); done \
-                < <(find "$BARCODE_SUBDIR" "${READ_FIND_EXPR[@]}" -print0)
+                < <(find -L "$BARCODE_SUBDIR" "${READ_FIND_EXPR[@]}" -print0)
             echo "$LOG Reads: ${#FASTQ_FILES[@]} file(s) from $(basename "$BARCODE_SUBDIR")/ (matched by barcode number $REF_NUM)"
         else
             FASTQ_FILES=("${SHARED_FASTQ[@]}")
@@ -245,33 +284,63 @@ process_one() {
     local MERGED_FASTQ="$SAMPLE_DIR/${REF_NAME}.merged.fastq.gz"
     if [[ ! -s "$MERGED_FASTQ" ]]; then
         echo "$LOG [1/6] Merging ${#FASTQ_FILES[@]} read file(s) -> $(basename "$MERGED_FASTQ")"
-        : > "${MERGED_FASTQ%.gz}.tmp"
+        # Concatenated gzip members form a valid .gz file, so existing
+        # .fastq.gz inputs are appended as-is instead of being decompressed
+        # and re-compressed with single-threaded gzip.
         for f in "${FASTQ_FILES[@]}"; do
             if [[ "$f" == *.gz ]]; then
-                zcat "$f" >> "${MERGED_FASTQ%.gz}.tmp"
+                cat "$f"
             else
-                cat "$f" >> "${MERGED_FASTQ%.gz}.tmp"
+                $FAST_GZIP -c "$f"
             fi
-        done
-        gzip -c "${MERGED_FASTQ%.gz}.tmp" > "$MERGED_FASTQ"
-        rm -f "${MERGED_FASTQ%.gz}.tmp"
+        done > "${MERGED_FASTQ}.tmp"
+        mv -f "${MERGED_FASTQ}.tmp" "$MERGED_FASTQ"
     else
         echo "$LOG [1/6] Merged reads already exist, skipping"
     fi
 
-    # 2. Optional QC filtering with NanoFilt
+    # 2. Optional QC filtering (chopper > NanoFilt) and read cap (max_reads).
+    #    With max_reads > 0 the stream stops as soon as enough passing reads
+    #    were collected, so the filter never has to scan the whole run.
+    #    `|| true` inside the subshell absorbs the SIGPIPE that zcat/filter
+    #    receive when `head` closes early (otherwise pipefail aborts).
     local READS_FOR_MAPPING="$MERGED_FASTQ"
-    if [[ "$MIN_LEN" -gt 0 || "$MIN_QUAL" -gt 0 ]]; then
-        if command -v NanoFilt >/dev/null 2>&1; then
-            local FILTERED_FASTQ="$SAMPLE_DIR/${REF_NAME}.filtered.fastq.gz"
-            echo "$LOG [2/6] QC filtering (length>=$MIN_LEN, quality>=$MIN_QUAL) -> $(basename "$FILTERED_FASTQ")"
-            zcat "$MERGED_FASTQ" | NanoFilt -l "$MIN_LEN" -q "$MIN_QUAL" | gzip > "$FILTERED_FASTQ"
-            READS_FOR_MAPPING="$FILTERED_FASTQ"
+    local CAP_CMD=(cat)
+    local CAP_NOTE="all reads"
+    if [[ "$MAX_READS" -gt 0 ]]; then
+        CAP_CMD=(head -n "$((MAX_READS * 4))")
+        CAP_NOTE="first $MAX_READS passing reads"
+    fi
+    run_filter() {
+        if [[ "$READ_FILTER_TOOL" == "chopper" ]]; then
+            chopper -l "$MIN_LEN" -q "$MIN_QUAL" -t "$THREADS"
         else
-            echo "$LOG [2/6] WARNING: NanoFilt not found; requested QC filtering was skipped" >&2
+            NanoFilt -l "$MIN_LEN" -q "$MIN_QUAL"
         fi
+    }
+    if [[ "$MIN_LEN" -gt 0 || "$MIN_QUAL" -gt 0 ]] && [[ -n "$READ_FILTER_TOOL" ]]; then
+        local FILTERED_FASTQ="$SAMPLE_DIR/${REF_NAME}.filtered.fastq.gz"
+        echo "$LOG [2/6] QC filtering with $READ_FILTER_TOOL (length>=$MIN_LEN, quality>=$MIN_QUAL, $CAP_NOTE) -> $(basename "$FILTERED_FASTQ")"
+        ( (zcat "$MERGED_FASTQ" | run_filter) 2>>"$SAMPLE_DIR/${REF_NAME}.filter.log" || true ) \
+            | "${CAP_CMD[@]}" | $FAST_GZIP > "$FILTERED_FASTQ"
+        READS_FOR_MAPPING="$FILTERED_FASTQ"
     else
-        echo "$LOG [2/6] QC filtering disabled"
+        if [[ "$MIN_LEN" -gt 0 || "$MIN_QUAL" -gt 0 ]]; then
+            echo "$LOG [2/6] WARNING: chopper/NanoFilt not found; requested QC filtering was skipped" >&2
+        else
+            echo "$LOG [2/6] QC filtering disabled"
+        fi
+        if [[ "$MAX_READS" -gt 0 ]]; then
+            local SUBSAMPLED_FASTQ="$SAMPLE_DIR/${REF_NAME}.subsampled.fastq.gz"
+            echo "$LOG [2/6] Read cap: $CAP_NOTE -> $(basename "$SUBSAMPLED_FASTQ")"
+            ( zcat "$MERGED_FASTQ" 2>/dev/null || true ) \
+                | "${CAP_CMD[@]}" | $FAST_GZIP > "$SUBSAMPLED_FASTQ"
+            READS_FOR_MAPPING="$SUBSAMPLED_FASTQ"
+        fi
+    fi
+    if [[ ! -s "$READS_FOR_MAPPING" ]] || [[ -z "$(zcat "$READS_FOR_MAPPING" 2>/dev/null | head -c 1 || true)" ]]; then
+        echo "$LOG [SKIP] no reads left after QC filtering" >&2
+        return 1
     fi
 
     # 3. Map to reference with minimap2, sort/index with samtools
@@ -321,7 +390,7 @@ process_one() {
     else
         # FORMAT/DP and FORMAT/AD let the UI calculate per-call depth and
         # alternate-allele fraction instead of relying on QUAL alone.
-        bcftools mpileup $BCFTOOLS_PLATFORM_OPT -a FORMAT/DP,FORMAT/AD -f "$REF_PATH" "$SORTED_BAM" \
+        bcftools mpileup $BCFTOOLS_PLATFORM_OPT -d "$MPILEUP_MAX_DEPTH" -a FORMAT/DP,FORMAT/AD -f "$REF_PATH" "$SORTED_BAM" \
             | bcftools call --ploidy 1 -mv -Oz -o "$VCF"
         bcftools index -f "$VCF"
     fi
@@ -402,7 +471,7 @@ echo "==================================================================="
 echo " Running $JOB_COUNT sample(s), $PARALLEL_JOBS at a time"
 echo "==================================================================="
 
-export DATA_ROOT RESULTS_ROOT PRESET THREADS MIN_LEN MIN_QUAL VARIANT_CALLER BCFTOOLS_PLATFORM_OPT PILON_JAR PILON_MEM RUN_TIMESTAMP
+export DATA_ROOT RESULTS_ROOT PRESET THREADS MIN_LEN MIN_QUAL VARIANT_CALLER BCFTOOLS_PLATFORM_OPT PILON_JAR PILON_MEM RUN_TIMESTAMP MAX_READS MPILEUP_MAX_DEPTH FAST_GZIP READ_FILTER_TOOL
 export -f process_one
 
 if [[ "$JOB_COUNT" -gt 0 ]]; then

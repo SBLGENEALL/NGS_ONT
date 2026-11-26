@@ -299,12 +299,31 @@ read가 짧다면 100bp까지 늘려도 됩니다.
 명령줄에서 바로 지정하고 싶으면 (non-interactive) `--edge-margin 50`
 옵션을 줄 수도 있습니다.
 
-### ONT 전용 변이 호출 설정 (`-X ont`, `--ploidy 1`)
+### 대용량 실데이터 성능 설정 (`max_reads`, `mpileup_max_depth`)
 
-`run_pipeline.sh`는 `bcftools mpileup`이 `-X`/`--config` 프리셋을
-지원하면 자동으로 `-X ont`를 적용합니다. 이 옵션은 ONT 리드의 indel
-에러 프로파일(특히 homopolymer 구간)을 고려해서 indel/SNP 호출
-파라미터를 조정해주므로, 기본값보다 false-positive 변이가 줄어듭니다.
+5-10 kb 플라스미드에 MinION barcode 하나가 수만~수십만 read를 주면 depth가
+수만×가 되고, merge → QC → mapping → `samtools consensus` 단계가 read 수에
+비례해 느려집니다. 이를 위해 다음을 적용했습니다.
+
+- `max_reads` (기본 5000, 0 = 전체): QC를 통과한 read를 앞에서부터 이 개수까지만
+  매핑합니다. 필터가 필요한 개수를 채우는 즉시 멈추므로 전체 run을 다 읽지 않습니다.
+  QC를 끄면 `<sample>.subsampled.fastq.gz`, 켜면 `<sample>.filtered.fastq.gz`에
+  상한이 적용된 read가 저장됩니다.
+- Merge: `.fastq.gz`는 압축 해제/재압축 없이 그대로 이어 붙입니다.
+- 압축은 `pigz`(있으면, 멀티스레드) 또는 `gzip -1`을 사용합니다.
+- QC 필터는 `chopper`가 있으면 우선 사용하고, 없으면 `NanoFilt`를 사용합니다.
+- `mpileup_max_depth` (기본 1000): `bcftools mpileup -d` 값입니다.
+- UI 경로에서 서버 FASTQ를 symlink로 staging하므로 `find -L`로 검색합니다
+  (이전에는 `find -type f`가 symlink를 건너뛰었습니다).
+
+### ONT 전용 변이 호출 설정 (`-B -Q5 --max-BQ 30`, `--ploidy 1`)
+
+`bcftools mpileup`에는 BAQ를 끄는 `-B`와 `-Q5 --max-BQ 30`을 적용합니다.
+이전 코드는 `-X ont` 지원 여부를 `bcftools mpileup | grep`으로 확인했는데,
+`bcftools mpileup`은 usage 출력 후 exit 1을 반환하므로 `set -o pipefail`
+아래에서는 항상 실패해 어떤 ONT 옵션도 적용되지 않았습니다. 또한 `-X ont`
+프리셋 자체는 `-I`(indel 호출 생략)를 포함하므로 indel 검출이 필요한 이
+파이프라인에서는 사용하지 않고, base-quality 관련 옵션만 직접 지정합니다.
 
 또한 `bcftools call`에는 `--ploidy 1`을 지정합니다. 플라스미드/벡터는
 단일 클론(haploid)이므로, 진짜 변이라면 거의 모든 read(>90%)가 그 변이를

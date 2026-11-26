@@ -341,7 +341,7 @@ def _raw_ont_tab() -> None:
         st.caption("Browser upload is intended for smaller datasets; large ONT runs should use a server path.")
 
     with st.expander("Analysis settings", expanded=True):
-        settings_cols = st.columns(4)
+        settings_cols = st.columns(5)
         threads = settings_cols[0].number_input(
             "CPU threads", min_value=1, max_value=max(1, os.cpu_count() or 1), value=min(8, os.cpu_count() or 1)
         )
@@ -355,6 +355,17 @@ def _raw_ont_tab() -> None:
             "Variant caller", ["bcftools (recommended)", "medaka", "pilon"]
         )
         caller = caller_label.split()[0]
+        max_reads = settings_cols[4].number_input(
+            "Max reads per sample",
+            min_value=0,
+            value=5000,
+            step=1000,
+            help=(
+                "QC를 통과한 read 중 앞에서부터 이 개수만 분석합니다 (0 = 전체). "
+                "5-10 kb plasmid에서 5000 reads면 보통 수백~수천× depth로 충분하며, "
+                "실제 MinION run 분석 시간을 크게 줄입니다."
+            ),
+        )
         pilon_jar = ""
         pilon_mem = "16G"
         if caller == "pilon":
@@ -386,6 +397,7 @@ def _raw_ont_tab() -> None:
                 variant_caller=caller,
                 pilon_jar=pilon_jar,
                 pilon_mem=pilon_mem,
+                max_reads=int(max_reads),
             )
             missing = missing_dependencies(analysis_settings)
             if missing:
