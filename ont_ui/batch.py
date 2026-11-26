@@ -9,6 +9,8 @@ import os
 import re
 import shutil
 import subprocess
+import time
+from collections import deque
 import uuid
 import zipfile
 from dataclasses import dataclass
@@ -462,27 +464,33 @@ def run_batch_job(
 ) -> Path:
     log_path = job.job_dir / "pipeline.log"
     command = ["bash", str(repository_root / "run_pipeline.sh"), str(job.config_path)]
-    recent: list[str] = []
-    with log_path.open("w", encoding="utf-8") as log_handle:
+    # The pipeline owns its log descriptor and can finish if the UI goes away.
+    with log_path.open("wb") as writer:
         process = subprocess.Popen(
-            command,
-            cwd=repository_root,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
+            command, cwd=repository_root, stdin=subprocess.DEVNULL,
+            stdout=writer, stderr=subprocess.STDOUT, start_new_session=True,
         )
-        assert process.stdout is not None
-        for line in process.stdout:
-            log_handle.write(line)
-            log_handle.flush()
-            clean = line.rstrip("\n")
-            recent.append(clean)
-            recent = recent[-40:]
-            if on_line:
-                on_line(clean)
-        return_code = process.wait()
+    recent: deque[str] = deque(maxlen=40)
+    with log_path.open("rb") as reader:
+        pending = b""
+        while True:
+            # Poll first so an exited child has already flushed its final lines.
+            return_code = process.poll()
+            chunk = reader.read(65536)
+            if chunk:
+                *lines, pending = (pending + chunk).split(b"\n")
+            elif return_code is not None:
+                lines = [pending] if pending else []
+            else:
+                time.sleep(0.15)
+                continue
+            for raw in lines:
+                line = raw.decode("utf-8", errors="replace").rstrip("\r")
+                recent.append(line)
+                if on_line:
+                    on_line(line)
+            if not chunk:
+                break
     if return_code != 0:
         raise BatchExecutionError(
             f"Batch pipeline exited with code {return_code}.\n" + "\n".join(recent)

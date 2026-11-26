@@ -7,10 +7,18 @@ import gzip
 import json
 import math
 import random
-from functools import lru_cache
 from collections import Counter
 from pathlib import Path
 from typing import TextIO
+
+
+try:
+    import numpy as np
+except ImportError:  # Standalone CLI installations can use the same lookup table.
+    np = None
+
+_ERROR_TABLE = tuple(10 ** (-max(0, code - 33) / 10) for code in range(256))
+_VECTOR_ERRORS = np.array(_ERROR_TABLE) if np is not None else None
 
 
 def _open_fastq(path: Path) -> TextIO:
@@ -29,9 +37,14 @@ def _n50(length_counts: Counter[int], total_bases: int) -> int:
     return 0
 
 
-@lru_cache(maxsize=128)
-def _error_probability(char: str) -> float:
-    return 10 ** (-max(0, ord(char) - 33) / 10)
+def _read_quality(quality: bytes) -> float:
+    if np is not None:
+        codes = np.frombuffer(quality, dtype=np.uint8)
+        score = -10 * math.log10(float(_VECTOR_ERRORS[codes].mean()))
+        # Preserve the previous summation order at reported Q10/20/30 boundaries.
+        if all(abs(score - cutoff) > 1e-8 for cutoff in (10, 20, 30)):
+            return score
+    return -10 * math.log10(sum(map(_ERROR_TABLE.__getitem__, quality)) / len(quality))
 
 
 def summarize_fastq(path: Path) -> dict[str, int | float]:
@@ -42,19 +55,19 @@ def summarize_fastq(path: Path) -> dict[str, int | float]:
     q10 = q20 = q30 = 0
     length_counts: Counter[int] = Counter()
 
-    with _open_fastq(path) as handle:
+    opener = gzip.open if path.name.lower().endswith(".gz") else open
+    with opener(path, "rb") as handle:
         while True:
             header = handle.readline()
             if not header:
                 break
-            sequence = handle.readline().rstrip("\r\n")
+            sequence = handle.readline().rstrip(b"\r\n")
             separator = handle.readline()
-            quality = handle.readline().rstrip("\r\n")
+            quality = handle.readline().rstrip(b"\r\n")
             if not sequence or not separator or len(sequence) != len(quality):
                 raise ValueError(f"Malformed FASTQ record in {path.name} near read {reads + 1}")
 
-            mean_error_probability = sum(map(_error_probability, quality)) / len(quality)
-            read_quality = -10 * math.log10(mean_error_probability)
+            read_quality = _read_quality(quality)
             length = len(sequence)
             reads += 1
             total_bases += length

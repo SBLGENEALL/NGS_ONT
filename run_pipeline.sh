@@ -254,6 +254,10 @@ process_one() {
     fi
 
     # 1. Merge reads
+    local compressor=(gzip -1c)
+    if command -v pigz >/dev/null 2>&1; then
+        compressor=(pigz -p "$THREADS" -1c)
+    fi
     local MERGED_FASTQ="$SAMPLE_DIR/${REF_NAME}.merged.fastq.gz"
     if [[ ! -s "$MERGED_FASTQ" ]]; then
         echo "$LOG [1/6] Merging ${#FASTQ_FILES[@]} read file(s) -> $(basename "$MERGED_FASTQ")"
@@ -263,7 +267,7 @@ process_one() {
             if [[ "${f,,}" == *.gz ]]; then
                 cat -- "$f"
             else
-                gzip -1c -- "$f"
+                "${compressor[@]}" -- "$f"
             fi
         done > "$merged_tmp"
         mv -- "$merged_tmp" "$MERGED_FASTQ"
@@ -271,17 +275,31 @@ process_one() {
         echo "$LOG [1/6] Merged reads already exist, skipping"
     fi
 
-    # 2. Optional QC filtering with NanoFilt
+    # 2. Optional QC filtering
     local READS_FOR_MAPPING="$MERGED_FASTQ"
     local FILTERED_FASTQ=""
     if [[ "$MIN_LEN" -gt 0 || "$MIN_QUAL" -gt 0 ]]; then
-        if command -v NanoFilt >/dev/null 2>&1; then
+        local filter=()
+        if command -v chopper >/dev/null 2>&1; then
+            # A single filter worker preserves input order for seeded sampling.
+            filter=(chopper -t 1 -l "$MIN_LEN" -q "$MIN_QUAL")
+        elif command -v NanoFilt >/dev/null 2>&1; then
+            filter=(NanoFilt -l "$MIN_LEN" -q "$MIN_QUAL")
+        fi
+        if (( ${#filter[@]} )); then
             FILTERED_FASTQ="$SAMPLE_DIR/${REF_NAME}.filtered.fastq.gz"
-            echo "$LOG [2/6] QC filtering (length>=$MIN_LEN, quality>=$MIN_QUAL) -> $(basename "$FILTERED_FASTQ")"
-            zcat "$MERGED_FASTQ" | NanoFilt -l "$MIN_LEN" -q "$MIN_QUAL" | gzip -1 > "$FILTERED_FASTQ"
+            echo "$LOG [2/6] QC filtering with ${filter[0]} + ${compressor[0]} (length>=$MIN_LEN, quality>=$MIN_QUAL) -> $(basename "$FILTERED_FASTQ")"
+            local filtered_tmp
+            filtered_tmp=$(mktemp "$SAMPLE_DIR/.filtered.XXXXXXXX")
+            if ! gzip -dc -- "$MERGED_FASTQ" | "${filter[@]}" | "${compressor[@]}" > "$filtered_tmp"; then
+                rm -f -- "$filtered_tmp"
+                echo "$LOG [ERROR] FASTQ filter/compression failed" >&2
+                return 1
+            fi
+            mv -- "$filtered_tmp" "$FILTERED_FASTQ"
             READS_FOR_MAPPING="$FILTERED_FASTQ"
         else
-            echo "$LOG [2/6] WARNING: NanoFilt not found; requested QC filtering was skipped" >&2
+            echo "$LOG [2/6] WARNING: chopper and NanoFilt not found; requested QC filtering was skipped" >&2
         fi
     else
         echo "$LOG [2/6] QC filtering disabled"

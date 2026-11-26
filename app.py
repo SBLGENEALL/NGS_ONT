@@ -547,7 +547,7 @@ def _sample_stage_rows(
     qc_detail = (
         "Filtered FASTQ 생성"
         if filtered.is_file()
-        else ("NanoFilt 미적용" if qc_requested else "QC filter 비활성화")
+        else ("QC 필터 미적용" if qc_requested else "QC filter 비활성화")
     )
     screening = qc_summary.get("screening")
     screening_note = ""
@@ -1252,7 +1252,7 @@ def _batch_ont_tab(settings: dict[str, object]) -> None:
                         text=f"완료 {completed} / {job.sample_count} samples",
                     )
 
-            with st.spinner("Batch analysis를 실행하고 있습니다. 브라우저를 닫지 마세요…"):
+            with st.spinner("Batch analysis 실행 중… 서버 로그는 분석 폴더의 pipeline.log에 저장됩니다."):
                 run_batch_job(REPOSITORY_ROOT, job, on_line=show_line)
                 result = collect_batch_results(job)
             try:
@@ -1526,8 +1526,8 @@ def _sidebar_tool_status() -> None:
     for tool in required:
         icon = "✅" if shutil.which(tool) else "❌"
         st.caption(f"{icon} {tool}")
-    nanofilt_icon = "✅" if shutil.which("NanoFilt") else "⚪"
-    st.caption(f"{nanofilt_icon} NanoFilt · optional QC")
+    qc_tool = next((tool for tool in ("chopper", "NanoFilt") if shutil.which(tool)), None)
+    st.caption(f"✅ {qc_tool} · optional batch QC" if qc_tool else "⚪ chopper / NanoFilt · optional batch QC")
 
 def _sidebar() -> dict[str, object]:
     branding = _load_branding()

@@ -1,9 +1,12 @@
 import gzip
 import json
+import math
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from ont_ui import fastq_qc
 from ont_ui.fastq_qc import load_fastq_qc, sample_for_mapping, summarize_fastq
 
 
@@ -27,6 +30,18 @@ class FastqQcTests(unittest.TestCase):
             self.assertAlmostEqual(result["q10_read_fraction"], 1.0)
             self.assertAlmostEqual(result["q20_read_fraction"], 2 / 3)
             self.assertAlmostEqual(result["q30_read_fraction"], 1 / 3)
+
+    def test_lookup_quality_preserves_reported_cutoffs(self):
+        for quality in (b"+" * 6000, b"5" * 6000, b"?" * 6000, b"!5I" * 2000):
+            error_sum = sum(10 ** (-(q - 33) / 10) for q in quality)
+            expected = -10 * math.log10(error_sum / len(quality))
+            fast = fastq_qc._read_quality(quality)
+            with patch.object(fastq_qc, "np", None):
+                portable = fastq_qc._read_quality(quality)
+            for actual in (fast, portable):
+                self.assertAlmostEqual(actual, expected, places=9)
+                for threshold in (10, 20, 30):
+                    self.assertEqual(actual >= threshold, expected >= threshold)
 
     def test_screening_selects_reproducibly_and_skips_low_depth(self):
         with tempfile.TemporaryDirectory() as tmp:
