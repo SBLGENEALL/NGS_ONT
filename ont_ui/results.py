@@ -190,6 +190,17 @@ def parse_vcf_variants(
                     ad_total = sum(ad_values)
                     if ad_total > 0:
                         allele_fraction = ad_values[alt_index + 1] / ad_total
+                if allele_fraction is None and info.get("SR"):
+                    # medaka: SR = spanning reads per allele by strand
+                    # (ref fwd, ref rev, alt1 fwd, alt1 rev, ...).
+                    try:
+                        sr_values = [int(item) for item in info["SR"].split(",")]
+                    except ValueError:
+                        sr_values = []
+                    sr_total = sum(sr_values)
+                    alt_slice = sr_values[2 + 2 * alt_index: 4 + 2 * alt_index]
+                    if sr_total > 0 and len(alt_slice) == 2:
+                        allele_fraction = sum(alt_slice) / sr_total
 
                 pos, kind, display_ref, display_alt, length = _classify_vcf(
                     raw_pos, ref, alt

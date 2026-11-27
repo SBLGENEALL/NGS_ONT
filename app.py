@@ -44,6 +44,23 @@ from ont_ui.batch import (
     uploaded_samples,
 )
 from ont_ui.fastq_qc import load_fastq_qc
+from ont_ui.basecall import (
+    KITS,
+    BasecallError,
+    BasecallSettings,
+    available_models,
+    basecall_job_state,
+    basecall_jobs,
+    basecall_log_tail,
+    count_pod5,
+    default_output_dir,
+    dorado_executable,
+    gpu_summary,
+    models_root,
+    prepare_basecall_job,
+    start_basecall_job,
+    stop_basecall_job,
+)
 from ont_ui.sequences import (
     SequenceValidationError,
     sanitize_name,
@@ -75,6 +92,10 @@ DEFAULT_ANALYSIS_SETTINGS: dict[str, dict[str, object]] = {
         "threads": BatchSettings.threads,
         "parallel_jobs": BatchSettings.parallel_jobs,
         "screening_depth": BatchSettings.screening_depth,
+        "variant_caller": BatchSettings.variant_caller,
+        "medaka_model": BatchSettings.medaka_model,
+        "medaka_device": BatchSettings.medaka_device,
+        "medaka_gpu_slots": BatchSettings.medaka_gpu_slots,
         "min_length": 500,
         "min_quality": 10,
         "min_variant_quality": 20.0,
@@ -295,10 +316,17 @@ def _analysis_settings(mode: str) -> dict[str, object]:
 
 def _close_settings_page() -> None:
     st.session_state["show_analysis_settings"] = False
+    st.session_state["show_basecall_page"] = False
 
 
 def _open_settings_page() -> None:
     st.session_state["show_analysis_settings"] = True
+    st.session_state["show_basecall_page"] = False
+
+
+def _open_basecall_page() -> None:
+    st.session_state["show_basecall_page"] = True
+    st.session_state["show_analysis_settings"] = False
 
 
 def _load_branding() -> dict[str, str]:
@@ -1318,7 +1346,8 @@ def _batch_ont_tab(settings: dict[str, object]) -> None:
     )
     st.caption(
         f"이번 분석 설정 · 샘플당 {threads_eff} threads × 동시 {parallel_eff} samples "
-        f"(CPU {cores} cores 기준) · Screening depth {depth_label}"
+        f"(CPU {cores} cores 기준) · Screening depth {depth_label} · "
+        f"Variant caller {settings.get('variant_caller', 'bcftools')}"
     )
     if st.button(
         f"Batch analysis 실행 ({total_samples} samples)",
@@ -1363,6 +1392,10 @@ def _batch_ont_tab(settings: dict[str, object]) -> None:
                 min_allele_fraction=float(settings.get("min_af", 0.80)),
                 circular=bool(settings.get("circular", True)),
                 edge_margin=int(settings.get("edge_margin", 50)),
+                variant_caller=str(settings.get("variant_caller", "bcftools")),
+                medaka_model=str(settings.get("medaka_model", "")).strip(),
+                medaka_device=str(settings.get("medaka_device", "gpu")),
+                medaka_gpu_slots=int(settings.get("medaka_gpu_slots", 4)),
             )
             with st.spinner("Reference와 FASTQ를 분석 폴더에 준비하고 있습니다…"):
                 job = prepare_batch_job(
@@ -1569,6 +1602,107 @@ def _raw_ont_tab(settings: dict[str, object]) -> None:
         _render_raw_result(raw_state)
 
 
+_STATE_LABEL = {
+    "running": "🔄 실행 중", "completed": "✅ 완료", "failed": "❌ 실패",
+    "stopped": "⏹ 중지됨", "interrupted": "⚠ 중단됨", "not_started": "대기",
+}
+
+
+def _basecall_page() -> None:
+    st.subheader("Dorado basecalling (GPU)")
+    st.caption(
+        "POD5를 Dorado로 다시 basecalling하고 barcode별 FASTQ(`fastq_pass/barcodeNN`)로 정리합니다. "
+        "SUP 모델을 쓰면 HAC보다 read Q가 높아지고(보통 Q20 이상) homopolymer·메틸화 자리 오류가 줄어듭니다."
+    )
+    dorado = dorado_executable()
+    gpu = gpu_summary()
+    cols = st.columns(3)
+    cols[0].metric("Dorado", "사용 가능" if dorado else "없음", help=dorado or "PATH 또는 ONT_DORADO 환경변수로 지정")
+    cols[1].metric("GPU", gpu.split(",")[0] if gpu else "없음", help=gpu or "nvidia-smi 없음")
+    models = available_models()
+    cols[2].metric("모델", f"{len(models)}개", help=f"모델 폴더: {models_root()} (ONT_DORADO_MODELS)")
+    if not dorado:
+        st.error("Dorado 실행 파일을 찾을 수 없습니다. 서버에 Dorado를 설치하고 PATH 또는 ONT_DORADO에 등록하세요.")
+
+    jobs = basecall_jobs(UI_RUN_ROOT)
+    running = [job for job in jobs if basecall_job_state(job.job_dir) == "running"]
+    if jobs:
+        st.markdown("#### 최근 basecalling 작업")
+        for job in jobs[:5]:
+            state = basecall_job_state(job.job_dir)
+            with st.expander(
+                f"{_STATE_LABEL.get(state, state)} · {Path(job.settings.model_path).name} · "
+                f"{Path(job.settings.pod5_dir).name} → {job.settings.output_dir}",
+                expanded=state == "running",
+            ):
+                tail = basecall_log_tail(job, 12)
+                if tail:
+                    st.code("\n".join(tail), language=None)
+                if state == "running":
+                    left, right = st.columns(2)
+                    if left.button("진행 상황 새로고침", key=f"bc_refresh_{job.job_dir.name}", use_container_width=True):
+                        st.rerun()
+                    if right.button("이 작업 중지", key=f"bc_stop_{job.job_dir.name}", use_container_width=True):
+                        if stop_basecall_job(job):
+                            st.info("중지 신호를 보냈습니다. 잠시 후 새로고침하세요.")
+                elif state == "completed":
+                    st.success(
+                        "완료. Batch analysis에서 FASTQ 폴더로 다음 경로를 선택하세요: "
+                        f"`{Path(job.settings.output_dir) / 'fastq_pass'}`"
+                    )
+
+    st.markdown("#### 새 basecalling")
+    if running:
+        st.warning("GPU에서 basecalling이 이미 실행 중입니다. 끝난 뒤 새 작업을 시작하세요.")
+    pod5_dir = _server_folder_browser("POD5 폴더 선택", "basecall_pod5", (".pod5",))
+    pod5_count = count_pod5(pod5_dir) if pod5_dir else 0
+    if pod5_dir:
+        st.caption(f"POD5 파일 {pod5_count}개 (하위 폴더 포함)")
+    model_labels = [path.name for path in models]
+    if model_labels:
+        model_name = st.selectbox(
+            "Basecall 모델", model_labels,
+            help="SUP 모델을 권장합니다. 인터넷 PC에서 `dorado download --model <이름> --models-directory <폴더>`로 받아 "
+                 f"`{models_root()}`에 넣으면 목록에 나타납니다.",
+        )
+        model_path = str(models_root() / model_name)
+    else:
+        model_path = st.text_input(
+            "Basecall 모델 폴더 경로",
+            placeholder=str(models_root() / "dna_r10.4.1_e8.2_400bps_sup@v5.2.0"),
+            help="모델 폴더가 비어 있습니다. 인터넷 PC에서 dorado download로 받아 서버로 옮긴 경로를 입력하세요.",
+        )
+    kit_labels = [kit or "barcode 없음" for kit in KITS]
+    kit_choice = st.selectbox(
+        "Kit", kit_labels, index=0,
+        help="시퀀싱에 사용한 kit입니다. Native barcoding이면 SQK-NBD114-96, Rapid barcoding이면 SQK-RBK114-96.",
+    )
+    kit = "" if kit_choice == "barcode 없음" else kit_choice
+    device = st.text_input("Device", value="cuda:all", help="모든 GPU: cuda:all, 특정 GPU: cuda:0")
+    suggested = str(default_output_dir(pod5_dir, model_path)) if pod5_dir and model_path else ""
+    output_dir = st.text_input(
+        "출력 폴더", value=suggested,
+        help="기본값은 POD5 폴더 옆의 새 폴더입니다. Batch analysis 폴더 탐색기에서 보이도록 data 폴더 안에 두세요.",
+    )
+    can_start = bool(dorado and pod5_dir and pod5_count and model_path and output_dir and not running)
+    if st.button("Basecalling 시작", type="primary", disabled=not can_start, use_container_width=True):
+        try:
+            job = prepare_basecall_job(
+                UI_RUN_ROOT,
+                BasecallSettings(
+                    pod5_dir=str(pod5_dir), output_dir=output_dir.strip(),
+                    model_path=model_path.strip(), kit_name=kit, device=device.strip() or "cuda:all",
+                ),
+            )
+            start_basecall_job(job)
+        except (BasecallError, OSError) as exc:
+            st.error(str(exc))
+        else:
+            st.success("Basecalling을 시작했습니다. 창을 닫아도 서버에서 계속 실행됩니다.")
+            st.rerun()
+    st.button("← 분석 화면으로", on_click=_close_settings_page, key="basecall_back")
+
+
 def _restore_resource_defaults() -> None:
     current = _analysis_settings("Batch analysis")
     for key in ("threads", "parallel_jobs", "screening_depth"):
@@ -1630,6 +1764,36 @@ def _settings_page() -> None:
                 step=1,
                 help="평균 Phred quality가 이 값보다 낮은 read를 제외합니다.",
             )
+            caller_options = ["bcftools", "medaka"]
+            current_caller = str(current.get("variant_caller", "bcftools"))
+            updated["variant_caller"] = st.selectbox(
+                "Variant caller",
+                caller_options,
+                index=caller_options.index(current_caller) if current_caller in caller_options else 0,
+                help="bcftools: 빠른 통계 기반 호출(기본). medaka: ONT 신경망 기반 호출로 homopolymer 주변 "
+                     "indel 판정이 더 정확합니다. medaka 실패 시 자동으로 bcftools로 대체합니다.",
+            )
+            updated["medaka_model"] = st.text_input(
+                "medaka model (비우면 자동)",
+                value=str(current.get("medaka_model", "")),
+                help="비워두면 FASTQ header의 basecall 모델로 자동 선택합니다 "
+                     "(예: ..._hac@v5.2.0 → r1041_e82_400bps_hac_variant_v5.0.0). 모델 이름 또는 파일 경로를 넣을 수 있습니다.",
+            )
+            device_options = ["gpu", "cpu"]
+            current_device = str(current.get("medaka_device", "gpu"))
+            updated["medaka_device"] = st.selectbox(
+                "medaka device",
+                device_options,
+                index=device_options.index(current_device) if current_device in device_options else 0,
+                help="gpu: CUDA GPU가 있으면 사용합니다. cpu: GPU를 사용하지 않습니다.",
+            )
+            updated["medaka_gpu_slots"] = st.number_input(
+                "medaka GPU 동시 실행 수",
+                min_value=1,
+                max_value=32,
+                value=int(current.get("medaka_gpu_slots", 4)),
+                help="여러 샘플이 GPU를 동시에 쓰는 개수 상한입니다. 96 GB GPU는 4-8이면 충분합니다.",
+            )
         with threshold_col:
             st.markdown("#### Variant review")
             updated["min_variant_quality"] = st.number_input(
@@ -1679,8 +1843,12 @@ def _sidebar_tool_status() -> None:
     for tool in required:
         icon = "✅" if shutil.which(tool) else "❌"
         st.caption(f"{icon} {tool}")
-    qc_tool = next((tool for tool in ("chopper", "NanoFilt") if shutil.which(tool)), None)
-    st.caption(f"✅ {qc_tool} · optional batch QC" if qc_tool else "⚪ chopper / NanoFilt · optional batch QC")
+    st.caption("✅ read QC/filter · built-in")
+    medaka = shutil.which("medaka_variant") or shutil.which("medaka_haploid_variant")
+    st.caption(f"{'✅' if medaka else '⚪'} medaka · optional caller")
+    st.caption(f"{'✅' if dorado_executable() else '⚪'} dorado · basecalling")
+    gpu = gpu_summary()
+    st.caption(f"{'✅' if gpu else '⚪'} GPU · {gpu.split(',')[0] if gpu else '없음'}")
 
 def _sidebar() -> dict[str, object]:
     branding = _load_branding()
@@ -1771,6 +1939,13 @@ def _sidebar() -> dict[str, object]:
         _sidebar_tool_status()
 
         st.button(
+            "⚡ Dorado basecalling (GPU)",
+            type="secondary",
+            use_container_width=True,
+            on_click=_open_basecall_page,
+            help="POD5를 Dorado SUP 모델로 다시 basecalling하고 barcode별 FASTQ로 정리합니다.",
+        )
+        st.button(
             "⚙ Analysis settings",
             type="secondary",
             use_container_width=True,
@@ -1798,6 +1973,8 @@ def main() -> None:
     _brand_header()
     if st.session_state.get("show_analysis_settings", False):
         _settings_page()
+    elif st.session_state.get("show_basecall_page", False):
+        _basecall_page()
     else:
         _batch_ont_tab(settings)
 

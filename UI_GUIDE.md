@@ -226,3 +226,30 @@ bash -n run_pipeline.sh run_ui.sh launch_ui.sh install_linux_launcher.sh
   - N50이 reference의 80% 미만이면 DNA 절단·분해, 복수 제한효소 자리, 짧은 오염 DNA를 의심합니다.
 - Read 필터(길이/mean Q)는 `ont_ui/fastq_qc.py`가 QC와 같은 한 번의 읽기에서 수행합니다
   (NanoFilt/chopper와 같은 mean-Q 정의, NanoFilt 결과와 동일한 출력을 확인함). NanoFilt 설치는 더 이상 필요 없습니다.
+
+## CPU 자동 배분
+
+`Analysis settings`에서 Threads / Parallel samples가 0(기본값)이면 자동 배분합니다.
+샘플이 많으면 샘플당 2 threads로 더 많은 샘플을 동시에 처리하고(256코어·96샘플 → 2 × 96),
+샘플이 적으면 샘플당 최대 16 threads를 씁니다(256코어·5샘플 → 16 × 5).
+
+## Dorado basecalling (GPU)
+
+사이드바 **⚡ Dorado basecalling (GPU)** 화면에서 POD5를 다시 basecalling합니다.
+
+1. 인터넷 PC에서 모델 다운로드 후 서버의 모델 폴더(기본 `/data/dorado_models`, `ONT_DORADO_MODELS`로 변경)에 복사:
+   `dorado download --model dna_r10.4.1_e8.2_400bps_sup@v5.2.0 --models-directory <폴더>`
+2. POD5 폴더 선택 → 모델(SUP 권장) → Kit(SQK-RBK114-96 / SQK-NBD114-96 등) → **Basecalling 시작**.
+3. 결과는 `<출력 폴더>/fastq_pass/barcodeNN/*.fastq.gz`로 정리됩니다. Batch analysis에서 이 `fastq_pass` 폴더를 FASTQ로 선택하세요.
+4. 작업은 브라우저와 분리되어 실행되며, 같은 화면에서 진행 로그 확인·중지가 가능합니다. GPU 작업은 한 번에 하나만 실행합니다.
+
+Dorado 실행 파일은 PATH 또는 `ONT_DORADO`로 지정합니다. Blackwell GPU는 이를 지원하는 최신 Dorado 버전이 필요합니다.
+
+## medaka variant caller
+
+`Analysis settings` → **Variant caller: medaka**. ONT 신경망 기반 호출로 homopolymer 주변 indel 판정이 bcftools보다 정확합니다.
+- 모델을 비워두면 FASTQ header의 basecall 모델로 자동 선택합니다(HAC v5.x → `r1041_e82_400bps_hac_variant_v5.0.0`).
+  pip 설치 medaka 2.x에는 r10.4.1 400bps HAC/SUP variant 모델이 포함되어 오프라인에서도 동작합니다.
+- `medaka device: gpu`면 CUDA GPU를 사용하고, `medaka GPU 동시 실행 수`로 동시에 GPU를 쓰는 샘플 수를 제한합니다.
+- medaka가 없거나 실패하면 자동으로 bcftools로 대체하고 로그에 WARNING을 남깁니다.
+- medaka 2.x(`medaka_variant`)와 1.x(`medaka_haploid_variant`)를 모두 지원합니다. `bgzip`/`tabix`(htslib)가 필요합니다.

@@ -78,6 +78,10 @@ if [[ -n "$PILON_JAR" && "$PILON_JAR" != /* ]]; then
     PILON_JAR="$SCRIPT_DIR/$PILON_JAR"
 fi
 PILON_MEM="$(read_cfg pilon_mem 16G)"
+MEDAKA_MODEL="$(read_cfg medaka_model "")"
+MEDAKA_DEVICE="$(read_cfg medaka_device gpu)"
+MEDAKA_GPU_SLOTS="$(read_cfg medaka_gpu_slots 4)"
+(( MEDAKA_GPU_SLOTS < 1 )) && MEDAKA_GPU_SLOTS=1
 
 RUN_TIMESTAMP="$(date +%y%m%d_%H%M)"
 
@@ -361,11 +365,70 @@ process_one() {
     # 5. Variant calling
     local VCF="$SAMPLE_DIR/${REF_NAME}.vcf.gz"
     echo "$LOG [5/6] Calling variants ($VARIANT_CALLER) -> $(basename "$VCF")"
-    if [[ "$VARIANT_CALLER" == "medaka" ]] && command -v medaka_haploid_variant >/dev/null 2>&1; then
-        medaka_haploid_variant -i "$READS_FOR_MAPPING" -r "$REF_PATH" -o "$SAMPLE_DIR/medaka"
-        cp "$SAMPLE_DIR/medaka/medaka.annotated.vcf" "$SAMPLE_DIR/${REF_NAME}.vcf" 2>/dev/null || true
-        bgzip -f "$SAMPLE_DIR/${REF_NAME}.vcf"
+    run_bcftools_calls() {
+        # ONT-friendly mpileup: keep indel calling enabled and use per-sample
+        # alternate-allele fraction instead of relying on QUAL alone.
+        local BCFTOOLS_PLATFORM_ARGS=(-B -Q 5)
+        if [[ "$BCFTOOLS_PLATFORM_MODE" == "ont-sup" ]]; then
+            BCFTOOLS_PLATFORM_ARGS=(-X ont-sup)
+        fi
+        bcftools mpileup "${BCFTOOLS_PLATFORM_ARGS[@]}" -Ou \
+            -a FORMAT/DP,FORMAT/AD -f "$REF_PATH" "$SORTED_BAM" \
+            | bcftools call --ploidy 1 -mv -Oz -o "$VCF"
         bcftools index -f "$VCF"
+    }
+    if [[ "$VARIANT_CALLER" == "medaka" ]]; then
+        local medaka_ok=false
+        # medaka >= 2.0: `medaka_variant` is the haploid caller
+        # (medaka_haploid_variant was removed); medaka 1.x: medaka_haploid_variant.
+        local medaka_cmd=""
+        if command -v medaka_variant >/dev/null 2>&1 && medaka_variant -h 2>&1 | grep -qi "haploid"; then
+            medaka_cmd=medaka_variant
+        elif command -v medaka_haploid_variant >/dev/null 2>&1; then
+            medaka_cmd=medaka_haploid_variant
+        fi
+        if [[ -n "$medaka_cmd" ]]; then
+            local MEDAKA_DIR="$SAMPLE_DIR/medaka"
+            rm -rf -- "$MEDAKA_DIR"
+            # -s: realign spanning reads when annotating, which adds INFO/SR
+            #     (reads supporting each allele) -> allele fraction in the UI.
+            # Without -m, medaka picks the model from the basecall model in
+            # the FASTQ headers (e.g. ..._hac@v5.2.0 -> r1041_e82_400bps_hac_variant_v5.0.0).
+            local medaka_args=(-i "$READS_FOR_MAPPING" -r "$REF_PATH" -o "$MEDAKA_DIR" -t "$THREADS" -s)
+            if [[ -n "$MEDAKA_MODEL" ]]; then
+                medaka_args+=(-m "$MEDAKA_MODEL")
+            fi
+            # GPU: all samples share the GPU(s); MEDAKA_GPU_SLOTS limits how many
+            # medaka processes use it at the same time (flock slots).
+            # CPU: hide the GPU so torch never tries to use it.
+            local runner=()
+            if [[ "$MEDAKA_DEVICE" == "cpu" ]]; then
+                runner=(env CUDA_VISIBLE_DEVICES="")
+            elif command -v flock >/dev/null 2>&1; then
+                local slot=$(( $(cksum <<< "$REF_NAME" | cut -d' ' -f1) % MEDAKA_GPU_SLOTS ))
+                runner=(flock "$RESULTS_ROOT/.medaka_gpu_slot_${slot}.lock")
+            fi
+            echo "$LOG [5/6] $medaka_cmd (device=$MEDAKA_DEVICE, model=${MEDAKA_MODEL:-auto from FASTQ header})"
+            if "${runner[@]}" "$medaka_cmd" "${medaka_args[@]}" > "$SAMPLE_DIR/${REF_NAME}.medaka.log" 2>&1; then
+                local medaka_vcf=""
+                for candidate in "$MEDAKA_DIR/medaka.annotated.vcf" "$MEDAKA_DIR/medaka.vcf"; do
+                    if [[ -s "$candidate" ]]; then medaka_vcf="$candidate"; break; fi
+                done
+                if [[ -n "$medaka_vcf" ]]; then
+                    bcftools sort -Oz -o "$VCF" "$medaka_vcf"
+                    bcftools index -f "$VCF"
+                    medaka_ok=true
+                fi
+            fi
+            if [[ "$medaka_ok" != true ]]; then
+                echo "$LOG [5/6] WARNING: medaka failed (see ${REF_NAME}.medaka.log); falling back to bcftools" >&2
+            fi
+        else
+            echo "$LOG [5/6] WARNING: medaka (medaka_variant / medaka_haploid_variant) not found; falling back to bcftools" >&2
+        fi
+        if [[ "$medaka_ok" != true ]]; then
+            run_bcftools_calls
+        fi
     elif [[ "$VARIANT_CALLER" == "pilon" ]]; then
         if [[ -z "$PILON_JAR" || ! -f "$PILON_JAR" ]]; then
             echo "$LOG [SKIP] variant_caller=pilon but pilon_jar not found: '$PILON_JAR'" >&2
@@ -390,14 +453,7 @@ process_one() {
     else
         # FORMAT/DP and FORMAT/AD let the UI calculate per-call depth and
         # alternate-allele fraction instead of relying on QUAL alone.
-        local BCFTOOLS_PLATFORM_ARGS=(-B -Q 5)
-        if [[ "$BCFTOOLS_PLATFORM_MODE" == "ont-sup" ]]; then
-            BCFTOOLS_PLATFORM_ARGS=(-X ont-sup)
-        fi
-        bcftools mpileup "${BCFTOOLS_PLATFORM_ARGS[@]}" -Ou \
-            -a FORMAT/DP,FORMAT/AD -f "$REF_PATH" "$SORTED_BAM" \
-            | bcftools call --ploidy 1 -mv -Oz -o "$VCF"
-        bcftools index -f "$VCF"
+        run_bcftools_calls
     fi
 
     after_calls=$SECONDS
@@ -535,7 +591,7 @@ echo " Running $JOB_COUNT sample(s), $PARALLEL_JOBS at a time, $THREADS threads 
 echo "   resources   : $RESOURCE_NOTE"
 echo "==================================================================="
 
-export SCRIPT_DIR DATA_ROOT SCREENING_DEPTH RESULTS_ROOT PRESET THREADS MIN_LEN MIN_QUAL VARIANT_CALLER BCFTOOLS_PLATFORM_MODE PILON_JAR PILON_MEM RUN_TIMESTAMP
+export SCRIPT_DIR DATA_ROOT SCREENING_DEPTH RESULTS_ROOT PRESET THREADS MIN_LEN MIN_QUAL VARIANT_CALLER BCFTOOLS_PLATFORM_MODE PILON_JAR PILON_MEM MEDAKA_MODEL MEDAKA_DEVICE MEDAKA_GPU_SLOTS RUN_TIMESTAMP
 export -f process_one
 
 if [[ "$JOB_COUNT" -gt 0 ]]; then

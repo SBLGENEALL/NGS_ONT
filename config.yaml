@@ -55,3 +55,10 @@ pilon_mem: 16G
 # compatible -B -Q5), ont-sup, or compatible. ont-sup is tuned for SUP basecalls;
 # choose compatible for HAC/fast data if REVIEW indels look noisy.
 bcftools_profile: auto
+
+# medaka (variant_caller: medaka). Empty model = auto-select from the basecall
+# model in the FASTQ headers. medaka_device: gpu | cpu. medaka_gpu_slots limits
+# how many samples use the GPU at the same time.
+medaka_model: ""
+medaka_device: gpu
+medaka_gpu_slots: 4

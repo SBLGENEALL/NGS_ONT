@@ -174,6 +174,10 @@ class BatchSettings:
     circular: bool = True
     edge_margin: int = 50
     screening_depth: int = 100
+    variant_caller: str = "bcftools"   # bcftools | medaka
+    medaka_model: str = ""             # "" = auto from FASTQ basecall model
+    medaka_device: str = "gpu"         # gpu | cpu
+    medaka_gpu_slots: int = 4
 
 
 @dataclass(frozen=True)
@@ -338,7 +342,10 @@ def _write_config(path: Path, job: BatchJob, settings: BatchSettings) -> None:
         ("min_read_length", max(0, settings.min_read_length)),
         ("min_read_quality", max(0, settings.min_read_quality)),
         ("screening_depth", max(0, settings.screening_depth)),
-        ("variant_caller", "bcftools"),
+        ("variant_caller", settings.variant_caller if settings.variant_caller in {"bcftools", "medaka"} else "bcftools"),
+        ("medaka_model", settings.medaka_model),
+        ("medaka_device", settings.medaka_device if settings.medaka_device in {"gpu", "cpu"} else "gpu"),
+        ("medaka_gpu_slots", max(1, settings.medaka_gpu_slots)),
         ("pilon_jar", ""),
         ("pilon_mem", "16G"),
     ]
@@ -465,6 +472,7 @@ def prepare_batch_job(
                     "edge_margin": settings.edge_margin if settings.circular else 0,
                 },
                 "pipeline_settings": {
+                    "variant_caller": settings.variant_caller,
                     "screening_depth": settings.screening_depth,
                     "min_read_length": settings.min_read_length,
                     "min_read_quality": settings.min_read_quality,
@@ -785,7 +793,12 @@ def collect_batch_results(job: BatchJob) -> dict[str, object]:
             if vcf.is_file()
             else []
         )
-        variant_source = "bcftools"
+        variant_source = (
+            "medaka"
+            if (sample_dir / "medaka" / "medaka.annotated.vcf").is_file()
+            or (sample_dir / "medaka" / "medaka.vcf").is_file()
+            else "bcftools"
+        )
         if not events:
             events = parse_consensus_fallback_variants(
                 sample_dir / f"{sample_name}.samtools.consensus.fasta",
