@@ -81,3 +81,21 @@ class BasecallTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BasecallChoiceTests(unittest.TestCase):
+    def test_detect_kit_from_final_summary_and_newest_model(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp) / "run"
+            (run / "pod5_pass").mkdir(parents=True)
+            (run / "final_summary_FAX_abc.txt").write_text(
+                "instrument=MN\nprotocol=sequencing/sequencing_MIN114_DNA_e8_2_400K:FLO-MIN114:SQK-NBD114-96:400\n"
+            )
+            self.assertEqual(basecall.detect_kit(run / "pod5_pass"), "SQK-NBD114-96")
+            self.assertEqual(basecall.detect_kit(Path(tmp)), "")
+            models = [Path(n) for n in (
+                "dna_r10.4.1_e8.2_400bps_sup@v4.3.0", "dna_r10.4.1_e8.2_400bps_sup@v5.2.0",
+                "dna_r10.4.1_e8.2_400bps_hac@v5.0.0", "dna_r10.4.1_e8.2_400bps_fast@5.2.0")]
+            self.assertEqual(basecall.newest_model(models, "sup").name, "dna_r10.4.1_e8.2_400bps_sup@v5.2.0")
+            self.assertEqual(basecall.newest_model(models, "fast").name, "dna_r10.4.1_e8.2_400bps_fast@5.2.0")
+            self.assertIsNone(basecall.newest_model(models[:1], "hac"))

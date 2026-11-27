@@ -54,9 +54,13 @@ from ont_ui.basecall import (
     basecall_log_tail,
     count_pod5,
     default_output_dir,
+    detect_kit,
     dorado_executable,
+    gpu_devices,
     gpu_summary,
+    model_tier,
     models_root,
+    newest_model,
     prepare_basecall_job,
     start_basecall_job,
     stop_basecall_job,
@@ -1658,34 +1662,50 @@ def _basecall_page() -> None:
     pod5_count = count_pod5(pod5_dir) if pod5_dir else 0
     if pod5_dir:
         st.caption(f"POD5 파일 {pod5_count}개 (하위 폴더 포함)")
-    model_labels = [path.name for path in models]
-    if model_labels:
-        model_name = st.selectbox(
-            "Basecall 모델", model_labels,
-            help="SUP 모델을 권장합니다. 인터넷 PC에서 `dorado download --model <이름> --models-directory <폴더>`로 받아 "
-                 f"`{models_root()}`에 넣으면 목록에 나타납니다.",
+    # --- Model: pick the accuracy tier; the newest version is chosen automatically.
+    tier_labels = {"sup": "SUP · 가장 정확 (권장)", "hac": "HAC · 빠름", "fast": "FAST · 가장 빠름"}
+    tiers = [tier for tier in ("sup", "hac", "fast") if newest_model(models, tier) is not None]
+    model_path = ""
+    if tiers:
+        tier = st.selectbox(
+            "Basecall 정확도", tiers, format_func=lambda t: tier_labels[t],
+            help="같은 정확도 안에서는 가장 최신 버전 모델을 자동으로 사용합니다.",
         )
-        model_path = str(models_root() / model_name)
+        chosen = newest_model(models, tier)
+        with st.expander("모델 버전 직접 고르기 (선택)", expanded=False):
+            same_tier = [path.name for path in models if model_tier(path.name) == tier]
+            picked = st.selectbox("모델 버전", same_tier, index=same_tier.index(chosen.name))
+        model_path = str(models_root() / picked)
     else:
-        model_path = st.text_input(
-            "Basecall 모델 폴더 경로",
-            placeholder=str(models_root() / "dna_r10.4.1_e8.2_400bps_sup@v5.2.0"),
-            help="모델 폴더가 비어 있습니다. 인터넷 PC에서 dorado download로 받아 서버로 옮긴 경로를 입력하세요.",
-        )
-    kit_labels = [kit or "barcode 없음" for kit in KITS]
+        st.error(f"Basecall 모델이 없습니다. 모델 폴더: `{models_root()}`")
+
+    # --- Kit: detected from the MinKNOW run files when possible.
+    detected_kit = detect_kit(pod5_dir) if pod5_dir else ""
+    kit_options = list(KITS)
+    if detected_kit and detected_kit not in kit_options:
+        kit_options.insert(0, detected_kit)
     kit_choice = st.selectbox(
-        "Kit (필수)", kit_labels, index=None, placeholder="시퀀싱에 사용한 kit를 선택하세요",
-        help="시퀀싱에 사용한 kit입니다. Native barcoding이면 SQK-NBD114-96, Rapid barcoding이면 SQK-RBK114-96. "
-             "kit가 다르면 barcode가 잘못 분류되므로 기본값을 두지 않습니다.",
+        "Kit" + (" · run 정보에서 자동 감지됨" if detected_kit else " (필수)"),
+        kit_options,
+        index=kit_options.index(detected_kit) if detected_kit else None,
+        format_func=lambda kit: kit or "barcode 없음",
+        placeholder="시퀀싱에 사용한 kit를 선택하세요",
+        key=f"basecall_kit_{detected_kit or 'manual'}",
+        help="POD5 폴더 주변의 MinKNOW final_summary/report 파일에서 kit를 자동으로 읽습니다. "
+             "찾지 못하면 직접 선택하세요 (Native barcoding → SQK-NBD114-96, Rapid → SQK-RBK114-96).",
     )
-    kit = "" if kit_choice in (None, "barcode 없음") else kit_choice
-    device = st.text_input("Device", value="cuda:all", help="모든 GPU: cuda:all, 특정 GPU: cuda:0")
-    suggested = str(default_output_dir(pod5_dir, model_path)) if pod5_dir and model_path else ""
-    output_dir = st.text_input(
-        "출력 폴더", value=suggested,
-        help="기본값은 POD5 폴더 옆의 새 폴더입니다. Batch analysis 폴더 탐색기에서 보이도록 data 폴더 안에 두세요.",
-    )
-    output_path = Path(output_dir.strip()).expanduser() if output_dir.strip() else None
+    kit = kit_choice or ""
+
+    # --- Device: GPUs found by nvidia-smi.
+    device_choices = gpu_devices()
+    device_label = st.selectbox("실행 장치", [label for label, _ in device_choices])
+    device = dict(device_choices)[device_label]
+
+    # --- Output: always a new folder next to the POD5 folder.
+    output_dir = str(default_output_dir(pod5_dir, model_path)) if pod5_dir and model_path else ""
+    if output_dir:
+        st.caption(f"결과 저장 위치 (자동): `{output_dir}/fastq_pass/barcodeNN/`")
+
     blockers: list[str] = []
     if not dorado:
         blockers.append("Dorado 실행 파일을 찾지 못했습니다 (sidebar의 dorado 항목 확인).")
@@ -1699,17 +1719,6 @@ def _basecall_page() -> None:
         blockers.append(f"모델 폴더가 없습니다: `{model_path}`")
     if kit_choice is None:
         blockers.append("Kit를 선택하세요 (예: Native barcoding → SQK-NBD114-96).")
-    if output_path is None:
-        blockers.append("출력 폴더를 입력하세요.")
-    elif pod5_dir is not None and (
-        output_path.resolve() == pod5_dir.resolve() or pod5_dir.resolve() in output_path.resolve().parents
-    ):
-        blockers.append(
-            "출력 폴더는 POD5 폴더와 다른 새 폴더여야 합니다 (POD5 폴더 안이나 POD5 폴더 자체는 불가). "
-            "기본값(POD5 폴더 옆의 `basecall_sup_날짜`)을 권장합니다."
-        )
-    elif output_path.exists() and any(output_path.iterdir()):
-        blockers.append("출력 폴더가 이미 있고 비어 있지 않습니다. 새 폴더 이름을 입력하세요.")
     if running:
         blockers.append("다른 basecalling 작업이 실행 중입니다.")
     if blockers:
@@ -1721,7 +1730,7 @@ def _basecall_page() -> None:
                 UI_RUN_ROOT,
                 BasecallSettings(
                     pod5_dir=str(pod5_dir), output_dir=output_dir.strip(),
-                    model_path=model_path.strip(), kit_name=kit, device=device.strip() or "cuda:all",
+                    model_path=model_path.strip(), kit_name=kit, device=device,
                 ),
             )
             start_basecall_job(job)

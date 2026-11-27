@@ -111,6 +111,78 @@ def gpu_summary() -> str:
     return "; ".join(line.strip() for line in output.splitlines() if line.strip())
 
 
+_KIT_PATTERN = re.compile(r"SQK-[A-Z]{3}\d{3}(?:\.\d+)?(?:-\d+)?")
+
+
+def detect_kit(pod5_dir: Path) -> str:
+    """Kit name from MinKNOW run files (final_summary / report / sample sheet).
+
+    MinKNOW writes e.g. ``protocol=sequencing/...:FLO-MIN114:SQK-NBD114-96:400``
+    into final_summary_*.txt next to pod5_pass/. Searches the POD5 folder and
+    up to two parent folders. Returns "" if nothing is found.
+    """
+    patterns = ("final_summary*.txt", "report_*.json", "report_*.md", "sample_sheet*.csv")
+    folder = pod5_dir
+    for _ in range(3):
+        for pattern in patterns:
+            try:
+                candidates = sorted(folder.glob(pattern))
+            except OSError:
+                candidates = []
+            for path in candidates[:5]:
+                try:
+                    text = path.read_text(encoding="utf-8", errors="replace")[:2_000_000]
+                except OSError:
+                    continue
+                match = _KIT_PATTERN.search(text)
+                if match:
+                    return match.group(0)
+        if folder.parent == folder:
+            break
+        folder = folder.parent
+    return ""
+
+
+def gpu_devices() -> list[tuple[str, str]]:
+    """(label, dorado --device value) choices, all GPUs first, CPU last."""
+    choices: list[tuple[str, str]] = []
+    smi = shutil.which("nvidia-smi")
+    names: list[str] = []
+    if smi:
+        try:
+            output = subprocess.run(
+                [smi, "--query-gpu=index,name", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=10, check=False,
+            ).stdout
+            names = [line.strip() for line in output.splitlines() if line.strip()]
+        except (OSError, subprocess.SubprocessError):
+            names = []
+    if names:
+        choices.append((f"모든 GPU ({len(names)}개)", "cuda:all"))
+        for line in names:
+            index, _, name = line.partition(",")
+            choices.append((f"GPU {index.strip()} · {name.strip()}", f"cuda:{index.strip()}"))
+    choices.append(("CPU (매우 느림)", "cpu"))
+    return choices
+
+
+def model_tier(name: str) -> str:
+    for tier in ("sup", "hac", "fast"):
+        if f"_{tier}@" in name:
+            return tier
+    return ""
+
+
+def newest_model(models: list[Path], tier: str) -> Path | None:
+    """Newest model of a tier (by version number in the folder name)."""
+    def version(path: Path) -> tuple[int, ...]:
+        found = re.search(r"@v?(\d+(?:\.\d+)*)", path.name)
+        return tuple(int(part) for part in found.group(1).split(".")) if found else (0,)
+
+    matching = [path for path in models if model_tier(path.name) == tier]
+    return max(matching, key=version) if matching else None
+
+
 def count_pod5(folder: Path, recursive: bool = True) -> int:
     pattern = "**/*.pod5" if recursive else "*.pod5"
     try:
@@ -122,7 +194,12 @@ def count_pod5(folder: Path, recursive: bool = True) -> int:
 def default_output_dir(pod5_dir: Path, model_path: str) -> Path:
     tier = "sup" if "_sup@" in model_path else ("hac" if "_hac@" in model_path else "dorado")
     stamp = datetime.now().strftime("%Y%m%d_%H%M")
-    return pod5_dir.parent / f"basecall_{tier}_{stamp}"
+    candidate = pod5_dir.parent / f"basecall_{tier}_{stamp}"
+    suffix = 2
+    while candidate.exists() and any(candidate.iterdir()):
+        candidate = pod5_dir.parent / f"basecall_{tier}_{stamp}_{suffix}"
+        suffix += 1
+    return candidate
 
 
 def _script(settings: BasecallSettings, dorado: str, job_dir: Path) -> str:
