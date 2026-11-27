@@ -20,6 +20,57 @@ except (ImportError, ModuleNotFoundError):
 else:
     PYARROW_AVAILABLE = True
 
+import sys
+
+
+def _drop_stale_ont_ui_modules() -> None:
+    """Re-import ont_ui modules whose source changed since they were loaded.
+
+    The server runs with fileWatcherType=none, so Streamlit re-executes app.py
+    on every rerun but keeps already-imported ont_ui modules in memory. After
+    files are replaced on the server, a new app.py could otherwise meet an old
+    ont_ui module (ImportError) until the whole server is restarted.
+    """
+    loaded = [key for key in sys.modules if key == "ont_ui" or key.startswith("ont_ui.")]
+    if "_ont_ui_source_stamps" not in sys.modules:
+        # First run of this app.py in a server that may already hold ont_ui
+        # modules imported by an older app.py: start from a clean import.
+        sys.modules["_ont_ui_source_stamps"] = type(sys)("_ont_ui_source_stamps")
+        for stale in loaded:
+            sys.modules.pop(stale, None)
+        return
+    stamps = sys.modules["_ont_ui_source_stamps"]
+    for name, module in list(sys.modules.items()):
+        if name != "ont_ui" and not name.startswith("ont_ui."):
+            continue
+        source = getattr(module, "__file__", None)
+        try:
+            mtime = os.path.getmtime(source) if source else None
+        except OSError:
+            mtime = None
+        recorded = getattr(stamps, name.replace(".", "__"), None)
+        if recorded is not None and mtime is not None and mtime != recorded:
+            for stale in [key for key in sys.modules if key == "ont_ui" or key.startswith("ont_ui.")]:
+                sys.modules.pop(stale, None)
+            for key in list(vars(stamps)):
+                if not key.startswith("__"):
+                    delattr(stamps, key)
+            return
+
+
+def _record_ont_ui_stamps() -> None:
+    stamps = sys.modules["_ont_ui_source_stamps"]
+    for name, module in list(sys.modules.items()):
+        if name == "ont_ui" or name.startswith("ont_ui."):
+            source = getattr(module, "__file__", None)
+            try:
+                setattr(stamps, name.replace(".", "__"), os.path.getmtime(source))
+            except (OSError, TypeError):
+                pass
+
+
+_drop_stale_ont_ui_modules()
+
 from ont_ui.audit import append_usage_event
 from ont_ui.batch import (
     BatchExecutionError,
@@ -70,6 +121,8 @@ from ont_ui.sequences import (
     sanitize_name,
 )
 
+
+_record_ont_ui_stamps()
 
 REPOSITORY_ROOT = Path(__file__).resolve().parent
 UI_RUN_ROOT = Path(
