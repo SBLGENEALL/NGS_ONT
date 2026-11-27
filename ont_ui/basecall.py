@@ -67,8 +67,18 @@ def dorado_executable() -> str | None:
     return shutil.which("dorado")
 
 
+DEFAULT_MODEL_ROOTS = ("/opt/ont/dorado-models", "/data/dorado_models")
+
+
 def models_root() -> Path:
-    return Path(os.environ.get("ONT_DORADO_MODELS", "/data/dorado_models")).expanduser()
+    """ONT_DORADO_MODELS, else the MinKNOW model folder, else /data/dorado_models."""
+    configured = os.environ.get("ONT_DORADO_MODELS", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    for candidate in DEFAULT_MODEL_ROOTS:
+        if Path(candidate).is_dir():
+            return Path(candidate)
+    return Path(DEFAULT_MODEL_ROOTS[-1])
 
 
 def available_models(root: Path | None = None) -> list[Path]:

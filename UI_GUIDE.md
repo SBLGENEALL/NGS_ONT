@@ -237,7 +237,7 @@ bash -n run_pipeline.sh run_ui.sh launch_ui.sh install_linux_launcher.sh
 
 사이드바 **⚡ Dorado basecalling (GPU)** 화면에서 POD5를 다시 basecalling합니다.
 
-1. 인터넷 PC에서 모델 다운로드 후 서버의 모델 폴더(기본 `/data/dorado_models`, `ONT_DORADO_MODELS`로 변경)에 복사:
+1. 인터넷 PC에서 모델 다운로드 후 서버의 모델 폴더(MinKNOW 기본 `/opt/ont/dorado-models`가 있으면 자동 사용, 없으면 `/data/dorado_models`; `ONT_DORADO_MODELS`로 변경)에 복사:
    `dorado download --model dna_r10.4.1_e8.2_400bps_sup@v5.2.0 --models-directory <폴더>`
 2. POD5 폴더 선택 → 모델(SUP 권장) → Kit(SQK-RBK114-96 / SQK-NBD114-96 등) → **Basecalling 시작**.
 3. 결과는 `<출력 폴더>/fastq_pass/barcodeNN/*.fastq.gz`로 정리됩니다. Batch analysis에서 이 `fastq_pass` 폴더를 FASTQ로 선택하세요.
