@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 from collections import deque
@@ -457,32 +458,181 @@ def prepare_batch_job(
     return provisional
 
 
-def run_batch_job(
-    repository_root: Path,
-    job: BatchJob,
-    on_line: Callable[[str], None] | None = None,
-) -> Path:
+PID_FILE = "pipeline.pid"
+EXIT_CODE_FILE = "pipeline.exit_code"
+STOPPED_FILE = "pipeline.stopped"
+
+# The wrapper records the pipeline's exit code in a file, so any later
+# Streamlit session (after a rerun, browser disconnect or server restart) can
+# tell a finished run from a running or interrupted one.
+_WRAPPER = 'bash "$1" "$2"; rc=$?; printf "%s\\n" "$rc" > "$3"; exit "$rc"'
+
+
+def load_batch_job(job_dir: Path) -> BatchJob:
+    """Rebuild a BatchJob from the files prepare_batch_job wrote."""
+    job_dir = Path(job_dir)
+    manifest_path = job_dir / "batch_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return BatchJob(
+        job_dir,
+        job_dir / "batch_config.yaml",
+        manifest_path,
+        str(manifest.get("experiment_name", "")),
+        len(manifest.get("samples", [])),
+    )
+
+
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    stat = Path(f"/proc/{pid}/stat")
+    if stat.exists():
+        try:
+            # A finished child that nobody reaped stays as a zombie ("Z").
+            state = stat.read_text().rsplit(")", 1)[1].split()[0]
+            if state in {"Z", "X"}:
+                return False
+            cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+            return b"run_pipeline.sh" in cmdline
+        except (OSError, IndexError):
+            return True
+    return True
+
+
+def batch_job_state(job_dir: Path) -> str:
+    """'running', 'completed', 'failed', 'stopped', 'interrupted' or 'not_started'."""
+    job_dir = Path(job_dir)
+    exit_file = job_dir / EXIT_CODE_FILE
+    if exit_file.is_file():
+        try:
+            return "completed" if int(exit_file.read_text().strip() or 1) == 0 else "failed"
+        except ValueError:
+            return "failed"
+    pid_file = job_dir / PID_FILE
+    if not pid_file.is_file():
+        return "not_started"
+    try:
+        pid = int(pid_file.read_text().strip())
+    except ValueError:
+        return "interrupted"
+    if _process_alive(pid):
+        return "running"
+    return "stopped" if (job_dir / STOPPED_FILE).is_file() else "interrupted"
+
+
+def _job_dirs(run_root: Path) -> list[Path]:
+    if not run_root.is_dir():
+        return []
+    return sorted(
+        (path for path in run_root.iterdir() if (path / "batch_manifest.json").is_file()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+
+def active_batch_jobs(run_root: Path) -> list[BatchJob]:
+    return [load_batch_job(path) for path in _job_dirs(run_root) if batch_job_state(path) == "running"]
+
+
+def latest_batch_job(run_root: Path, states: Sequence[str] = ("completed", "failed")) -> BatchJob | None:
+    for path in _job_dirs(run_root):
+        if batch_job_state(path) in states:
+            return load_batch_job(path)
+    return None
+
+
+def completed_sample_count(job: BatchJob) -> int:
     log_path = job.job_dir / "pipeline.log"
-    command = ["bash", str(repository_root / "run_pipeline.sh"), str(job.config_path)]
+    try:
+        return log_path.read_bytes().count(b" Done: ")
+    except OSError:
+        return 0
+
+
+def log_tail(job: BatchJob, lines: int = 20) -> list[str]:
+    log_path = job.job_dir / "pipeline.log"
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - 64 * 1024))
+            text = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return []
+    return text.splitlines()[-lines:]
+
+
+def stop_batch_job(job: BatchJob) -> bool:
+    """Terminate a running batch (the whole process group). Returns True if signalled."""
+    if batch_job_state(job.job_dir) != "running":
+        return False
+    pid = int((job.job_dir / PID_FILE).read_text().strip())
+    (job.job_dir / STOPPED_FILE).write_text(datetime.now().isoformat(), encoding="utf-8")
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def start_batch_job(repository_root: Path, job: BatchJob) -> int:
+    """Start the pipeline detached from Streamlit. Returns the process id."""
+    if batch_job_state(job.job_dir) == "running":
+        raise BatchExecutionError("This batch job is already running.")
+    for name in (EXIT_CODE_FILE, STOPPED_FILE):
+        (job.job_dir / name).unlink(missing_ok=True)
+    log_path = job.job_dir / "pipeline.log"
+    command = [
+        "bash", "-c", _WRAPPER, "ont-batch",
+        str(repository_root / "run_pipeline.sh"),
+        str(job.config_path),
+        str(job.job_dir / EXIT_CODE_FILE),
+    ]
     # The pipeline owns its log descriptor and can finish if the UI goes away.
     with log_path.open("wb") as writer:
         process = subprocess.Popen(
             command, cwd=repository_root, stdin=subprocess.DEVNULL,
             stdout=writer, stderr=subprocess.STDOUT, start_new_session=True,
         )
+    (job.job_dir / PID_FILE).write_text(str(process.pid), encoding="utf-8")
+    _CHILDREN[process.pid] = process
+    return process.pid
+
+
+# Keep Popen objects of children started by this server process so they are
+# reaped (no zombies) and their exit status can be polled directly.
+_CHILDREN: dict[int, subprocess.Popen] = {}
+
+
+def follow_batch_job(
+    job: BatchJob,
+    on_line: Callable[[str], None] | None = None,
+    poll_interval: float = 0.15,
+) -> Path:
+    """Stream the job's log until it stops; raise BatchExecutionError on failure."""
+    log_path = job.job_dir / "pipeline.log"
+    pid_text = (job.job_dir / PID_FILE).read_text().strip() if (job.job_dir / PID_FILE).is_file() else ""
+    process = _CHILDREN.get(int(pid_text)) if pid_text.isdigit() else None
     recent: deque[str] = deque(maxlen=40)
     with log_path.open("rb") as reader:
         pending = b""
         while True:
-            # Poll first so an exited child has already flushed its final lines.
-            return_code = process.poll()
+            # Check state first so an exited job has already flushed its final lines.
+            if process is not None:
+                finished = process.poll() is not None
+            else:
+                finished = batch_job_state(job.job_dir) != "running"
             chunk = reader.read(65536)
             if chunk:
                 *lines, pending = (pending + chunk).split(b"\n")
-            elif return_code is not None:
+            elif finished:
                 lines = [pending] if pending else []
             else:
-                time.sleep(0.15)
+                time.sleep(poll_interval)
                 continue
             for raw in lines:
                 line = raw.decode("utf-8", errors="replace").rstrip("\r")
@@ -491,11 +641,24 @@ def run_batch_job(
                     on_line(line)
             if not chunk:
                 break
-    if return_code != 0:
+    if process is not None:
+        _CHILDREN.pop(process.pid, None)
+    state = batch_job_state(job.job_dir)
+    if state != "completed":
+        code = (job.job_dir / EXIT_CODE_FILE).read_text().strip() if (job.job_dir / EXIT_CODE_FILE).is_file() else state
         raise BatchExecutionError(
-            f"Batch pipeline exited with code {return_code}.\n" + "\n".join(recent)
+            f"Batch pipeline exited with code {code}.\n" + "\n".join(recent)
         )
     return log_path
+
+
+def run_batch_job(
+    repository_root: Path,
+    job: BatchJob,
+    on_line: Callable[[str], None] | None = None,
+) -> Path:
+    start_batch_job(repository_root, job)
+    return follow_batch_job(job, on_line)
 
 
 def collect_batch_results(job: BatchJob) -> dict[str, object]:
@@ -550,10 +713,23 @@ def collect_batch_results(job: BatchJob) -> dict[str, object]:
             if effective_qc
             else None
         )
+        diagnostics = fastq_qc.get("diagnostics")
+        if not isinstance(diagnostics, dict):
+            diagnostics = {}
+        histogram = effective_qc.get("length_histogram")
+        qc_fields = {
+            "basecall_model": diagnostics.get("basecall_model") or None,
+            "basecall_tier": diagnostics.get("basecall_tier") or None,
+            "full_length_read_fraction": effective_qc.get("full_length_read_fraction"),
+            "n50_to_reference": effective_qc.get("n50_to_reference"),
+            "qc_hints": list(diagnostics.get("hints") or []),
+            "length_histogram": histogram if isinstance(histogram, dict) else None,
+        }
         if not flagstat.is_file() or not depth_file.is_file():
             samples.append(
                 {
                     **item,
+                    **qc_fields,
                     "status": "ERROR",
                     "merged_reads": merged_reads or None,
                     "filtered_reads": filtered_reads,
@@ -631,13 +807,14 @@ def collect_batch_results(job: BatchJob) -> dict[str, object]:
                 "deletion": sum(event.kind == "Deletion" for event in events),
                 "variant_details": [event.as_row() for event in events],
                 "variant_source": variant_source,
+                **qc_fields,
             }
         )
 
     columns = [
         "Reference", "Sample #", "Sample ID", "Output name", "Status", "Total reads",
-        "Merged reads", "Filtered reads", "Read retention", "Read N50", "Mean read Q",
-        "Q10 reads", "Q20 reads", "Q30 reads", "Mapping rate", "Mean depth",
+        "Merged reads", "Filtered reads", "Read retention", "Read N50", "Full-length reads", "Mean read Q",
+        "Basecall model", "Q10 reads", "Q20 reads", "Q30 reads", "Mapping rate", "Mean depth",
         "Coverage 1x", "Coverage 10x", "Variants",
         "PASS variants", "REVIEW variants", "SNP", "Insertion", "Deletion",
     ]
@@ -657,7 +834,9 @@ def collect_batch_results(job: BatchJob) -> dict[str, object]:
                 "Filtered reads": sample.get("filtered_reads"),
                 "Read retention": sample.get("retained_fraction"),
                 "Read N50": sample.get("read_n50"),
+                "Full-length reads": sample.get("full_length_read_fraction"),
                 "Mean read Q": sample.get("mean_read_quality"),
+                "Basecall model": sample.get("basecall_model"),
                 "Q10 reads": sample.get("q10_read_fraction"),
                 "Q20 reads": sample.get("q20_read_fraction"),
                 "Q30 reads": sample.get("q30_read_fraction"),

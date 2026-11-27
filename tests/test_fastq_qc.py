@@ -71,3 +71,43 @@ class FastqQcTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FastqDiagnosticsTests(unittest.TestCase):
+    def test_basecall_model_and_tier_from_header(self):
+        header = b"@read1 runid=x ch=1 basecall_model_version_id=dna_r10.4.1_e8.2_400bps_hac@v5.2.0\n"
+        model = fastq_qc.basecall_model_from_header(header)
+        self.assertEqual(model, "dna_r10.4.1_e8.2_400bps_hac@v5.2.0")
+        self.assertEqual(fastq_qc.basecall_tier(model), "hac")
+        self.assertEqual(fastq_qc.basecall_tier("dna_r10.4.1_e8.2_400bps_sup@v5.2.0"), "sup")
+        self.assertEqual(fastq_qc.basecall_model_from_header(b"@plain\n"), "")
+
+    def test_single_pass_filter_matches_two_pass_and_reports_full_length(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            merged = Path(tmp) / "merged.fastq.gz"
+            model = "basecall_model_version_id=dna_r10.4.1_e8.2_400bps_hac@v5.2.0"
+            records = [
+                f"@full1 {model}\n{'A' * 1000}\n+\n{'5' * 1000}\n",   # Q20, full length
+                f"@full2 {model}\n{'C' * 1050}\n+\n{'+' * 1050}\n",   # Q10, full length
+                f"@short {model}\n{'G' * 300}\n+\n{'I' * 300}\n",     # too short
+                f"@lowq {model}\n{'T' * 1000}\n+\n{'%' * 1000}\n",    # Q4, fails -q 10
+            ]
+            merged.write_bytes(gzip.compress("".join(records).encode()))
+            out = Path(tmp) / "filtered.fastq.gz"
+            m, f, found = fastq_qc.summarize_and_filter(merged, out, 500, 10, reference_length=1000)
+            self.assertEqual(found, "dna_r10.4.1_e8.2_400bps_hac@v5.2.0")
+            self.assertEqual(m["reads"], 4)
+            self.assertEqual(f["reads"], 2)
+            self.assertEqual(summarize_fastq(out, 1000), f)
+            self.assertEqual(summarize_fastq(merged, 1000), m)
+            self.assertAlmostEqual(f["full_length_read_fraction"], 1.0)
+            self.assertAlmostEqual(m["short_read_fraction"], 0.25)
+            self.assertEqual(f["length_histogram"]["counts"], {"1000": 2})
+            hints = fastq_qc.diagnostics(m, f, found)["hints"]
+            self.assertTrue(any("SUP" in hint for hint in hints))
+
+    def test_fragmented_library_hint(self):
+        stats = {"n50": 4500, "n50_to_reference": 0.3, "full_length_read_fraction": 0.1}
+        hints = fastq_qc.diagnostics(stats, None, "dna_r10.4.1_e8.2_400bps_sup@v5.2.0")["hints"]
+        self.assertTrue(any("N50" in hint for hint in hints))
+        self.assertFalse(any("re-basecalling" in hint for hint in hints))

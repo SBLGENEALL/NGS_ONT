@@ -34,7 +34,7 @@
 #   ./run_pipeline.sh [config.yaml]
 #
 # Requires: minimap2, samtools, bcftools (or medaka if variant_caller=medaka)
-#           NanoFilt (optional, only used if min_read_length/quality > 0)
+#           (read QC/filtering is built in: ont_ui/fastq_qc.py, python3 + optional numpy/pigz)
 
 set -euo pipefail
 
@@ -81,17 +81,36 @@ PILON_MEM="$(read_cfg pilon_mem 16G)"
 
 RUN_TIMESTAMP="$(date +%y%m%d_%H%M)"
 
+# Never oversubscribe the machine: threads x parallel_jobs <= CPU cores.
+CPU_CORES="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
+REQUESTED_RESOURCES="threads=$THREADS x parallel_jobs=$PARALLEL_JOBS"
+if (( THREADS > CPU_CORES )); then THREADS=$CPU_CORES; fi
+if (( THREADS < 1 )); then THREADS=1; fi
+if (( THREADS * PARALLEL_JOBS > CPU_CORES )); then
+    PARALLEL_JOBS=$(( CPU_CORES / THREADS ))
+    if (( PARALLEL_JOBS < 1 )); then PARALLEL_JOBS=1; fi
+fi
+RESOURCE_NOTE="$CPU_CORES CPU cores"
+if [[ "$REQUESTED_RESOURCES" != "threads=$THREADS x parallel_jobs=$PARALLEL_JOBS" ]]; then
+    RESOURCE_NOTE="$CPU_CORES CPU cores; requested $REQUESTED_RESOURCES, capped"
+fi
+
 # Prefer the modern ONT SUP profile when the installed bcftools provides it.
 # The legacy `-X ont` profile contains `-I` (skip indels), so it must not be
 # used for a plasmid SNP/indel analyser. Older versions use compatible options
 # which keep indel calling enabled.
+# Override with `bcftools_profile: compatible` (e.g. for HAC/fast basecalls,
+# since ont-sup is tuned for SUP data) or `bcftools_profile: ont-sup`.
+BCFTOOLS_PROFILE_SETTING="$(read_cfg bcftools_profile auto)"
 BCFTOOLS_PLATFORM_MODE="compatible"
 BCFTOOLS_PROFILE="ONT compatible (-B -Q5)"
-if command -v bcftools >/dev/null 2>&1; then
+if [[ "$BCFTOOLS_PROFILE_SETTING" != "compatible" ]] && command -v bcftools >/dev/null 2>&1; then
     BCFTOOLS_CONFIGS="$(bcftools mpileup -X list 2>&1 || true)"
     if grep -qE '(^|[[:space:],])ont-sup([[:space:],]|$)' <<< "$BCFTOOLS_CONFIGS"; then
         BCFTOOLS_PLATFORM_MODE="ont-sup"
         BCFTOOLS_PROFILE="ont-sup"
+    elif [[ "$BCFTOOLS_PROFILE_SETTING" == "ont-sup" ]]; then
+        echo "WARNING: bcftools_profile=ont-sup requested but this bcftools has no ont-sup preset; using compatible options" >&2
     fi
 fi
 
@@ -101,6 +120,7 @@ echo "   references  : $REF_ROOT"
 echo "   data        : $DATA_ROOT"
 echo "   results     : $RESULTS_ROOT"
 echo "   preset      : $PRESET   threads/sample: $THREADS   screening depth: $SCREENING_DEPTH   parallel samples: $PARALLEL_JOBS"
+echo "   resources   : $RESOURCE_NOTE"
 echo "   bcftools    : $BCFTOOLS_PROFILE"
 echo "==================================================================="
 
@@ -277,54 +297,43 @@ process_one() {
     fi
 
     after_merge=$SECONDS
-    # 2. Optional QC filtering
+    # 2. Read QC (+ optional filtering) and optional screening sampling.
+    #    fastq_qc.py reads the merged FASTQ once: it computes merged metrics,
+    #    applies the length / mean-Q filter (same definition as NanoFilt and
+    #    chopper -q) and writes the filtered FASTQ plus its metrics in the
+    #    same pass. Previously the data was decompressed four times
+    #    (filter, merged QC, filtered QC, sampling); now it is at most twice.
     local READS_FOR_MAPPING="$MERGED_FASTQ"
     local FILTERED_FASTQ=""
-    if [[ "$MIN_LEN" -gt 0 || "$MIN_QUAL" -gt 0 ]]; then
-        local filter=()
-        if command -v chopper >/dev/null 2>&1; then
-            # A single filter worker preserves input order for seeded sampling.
-            filter=(chopper -t 1 -l "$MIN_LEN" -q "$MIN_QUAL")
-        elif command -v NanoFilt >/dev/null 2>&1; then
-            filter=(NanoFilt -l "$MIN_LEN" -q "$MIN_QUAL")
-        fi
-        if (( ${#filter[@]} )); then
-            FILTERED_FASTQ="$SAMPLE_DIR/${REF_NAME}.filtered.fastq.gz"
-            echo "$LOG [2/6] QC filtering with ${filter[0]} + ${compressor[0]} (length>=$MIN_LEN, quality>=$MIN_QUAL) -> $(basename "$FILTERED_FASTQ")"
-            local filtered_tmp
-            filtered_tmp=$(mktemp "$SAMPLE_DIR/.filtered.XXXXXXXX")
-            if ! gzip -dc -- "$MERGED_FASTQ" | "${filter[@]}" | "${compressor[@]}" > "$filtered_tmp"; then
-                rm -f -- "$filtered_tmp"
-                echo "$LOG [ERROR] FASTQ filter/compression failed" >&2
-                return 1
-            fi
-            mv -- "$filtered_tmp" "$FILTERED_FASTQ"
-            READS_FOR_MAPPING="$FILTERED_FASTQ"
-        else
-            echo "$LOG [2/6] WARNING: chopper and NanoFilt not found; requested QC filtering was skipped" >&2
-        fi
-    else
-        echo "$LOG [2/6] QC filtering disabled"
-    fi
-
-    after_filter=$SECONDS
-    # Persist compact read-QC metrics once so Streamlit never has to rescan a
-    # large FASTQ on every page refresh.
     local FASTQ_QC_JSON="$SAMPLE_DIR/${REF_NAME}.fastq_qc.json"
+    local reference_bases
+    reference_bases=$(awk '!/^>/{gsub(/[[:space:]]/, ""); n+=length} END{print n+0}' "$REF_PATH")
     local FASTQ_QC_ARGS=(
         --merged "$MERGED_FASTQ"
         --output "$FASTQ_QC_JSON"
+        --reference-length "$reference_bases"
+        --threads "$THREADS"
     )
-    if [[ -n "$FILTERED_FASTQ" && -s "$FILTERED_FASTQ" ]]; then
-        FASTQ_QC_ARGS+=(--filtered "$FILTERED_FASTQ")
+    local filtered_tmp=""
+    if [[ "$MIN_LEN" -gt 0 || "$MIN_QUAL" -gt 0 ]]; then
+        FILTERED_FASTQ="$SAMPLE_DIR/${REF_NAME}.filtered.fastq.gz"
+        filtered_tmp=$(mktemp "$SAMPLE_DIR/.filtered.XXXXXXXX")
+        FASTQ_QC_ARGS+=(--filter-out "$filtered_tmp" --min-length "$MIN_LEN" --min-quality "$MIN_QUAL")
+        echo "$LOG [2/6] Read QC + filtering in one pass (length>=$MIN_LEN, quality>=$MIN_QUAL) -> $(basename "$FILTERED_FASTQ")"
+    else
+        echo "$LOG [2/6] QC filtering disabled; computing read QC summary"
     fi
-    local sampled_tmp="" reference_bases
+    local sampled_tmp=""
     if (( SCREENING_DEPTH > 0 )); then
-        reference_bases=$(awk '!/^>/{gsub(/[[:space:]]/, ""); n+=length} END{print n+0}' "$REF_PATH")
         sampled_tmp=$(mktemp "$SAMPLE_DIR/.screening.XXXXXXXX")
         FASTQ_QC_ARGS+=(--target-bases "$(( SCREENING_DEPTH * reference_bases ))" --sample-out "$sampled_tmp")
     fi
-    if python "$SCRIPT_DIR/ont_ui/fastq_qc.py" "${FASTQ_QC_ARGS[@]}"; then
+    after_filter=$SECONDS
+    if python "$SCRIPT_DIR/ont_ui/fastq_qc.py" "${FASTQ_QC_ARGS[@]}" 2>&1 | sed "s|^|$LOG |"; then
+        if [[ -n "$filtered_tmp" ]]; then
+            mv -- "$filtered_tmp" "$FILTERED_FASTQ"
+            READS_FOR_MAPPING="$FILTERED_FASTQ"
+        fi
         if [[ -n "$sampled_tmp" ]]; then
             if [[ -s "$sampled_tmp" ]]; then
                 READS_FOR_MAPPING="$SAMPLE_DIR/${REF_NAME}.screening.fastq.gz"
@@ -335,12 +344,9 @@ process_one() {
         fi
         echo "$LOG [2/6] Read QC summary -> $(basename "$FASTQ_QC_JSON")"
     else
-        if (( SCREENING_DEPTH > 0 )); then
-            rm -f -- "$sampled_tmp"
-            echo "$LOG [ERROR] Cannot prepare screening input" >&2
-            return 1
-        fi
-        echo "$LOG [2/6] WARNING: Read QC summary could not be generated" >&2
+        rm -f -- "$filtered_tmp" "$sampled_tmp"
+        echo "$LOG [ERROR] Read QC / filtering failed (no usable reads after filtering?)" >&2
+        return 1
     fi
 
     after_qc=$SECONDS
@@ -418,7 +424,7 @@ process_one() {
         sed -i "1s/.*/>${REF_NAME}/" "$FINAL_CONSENSUS_FASTA"
     fi
 
-    echo "$LOG Timing (s): merge=$((after_merge-started)) filter=$((after_filter-after_merge)) QC_and_sampling=$((after_qc-after_filter)) mapping_and_BAM=$((after_map-after_qc)) raw_consensus=$((after_consensus-after_map)) variants=$((after_calls-after_consensus)) final=$((SECONDS-after_calls))"
+    echo "$LOG Timing (s): merge=$((after_merge-started)) QC_filter_and_sampling=$((after_qc-after_merge)) mapping_and_BAM=$((after_map-after_qc)) raw_consensus=$((after_consensus-after_map)) variants=$((after_calls-after_consensus)) final=$((SECONDS-after_calls))"
 
     # Per-sample summary report
     local REPORT="$SAMPLE_DIR/${REF_NAME}_report.md"
@@ -440,6 +446,22 @@ process_one() {
         echo "- Raw samtools consensus: ${REF_NAME}.samtools.consensus.fasta"
         echo "- Raw samtools consensus N count: ${N_COUNT}"
         echo "- Variants: ${REF_NAME}.vcf.gz"
+        python - "$FASTQ_QC_JSON" <<'PYQC' || true
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, ValueError):
+    sys.exit(0)
+diag = data.get("diagnostics") or {}
+reads = data.get("filtered") or data.get("merged") or {}
+if diag.get("basecall_model"):
+    print(f"- Basecall model: {diag['basecall_model']}")
+if "full_length_read_fraction" in reads:
+    print(f"- Read N50: {reads.get('n50', 0)} bp ({reads['n50_to_reference']:.0%} of reference); "
+          f"full-length reads (90-110%): {reads['full_length_read_fraction']:.0%}")
+for hint in diag.get("hints", []):
+    print(f"- QC hint: {hint}")
+PYQC
     } > "$REPORT"
 
     echo "$LOG Done: $SAMPLE_DIR"

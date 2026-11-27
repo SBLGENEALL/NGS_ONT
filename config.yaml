@@ -49,3 +49,8 @@ pilon_jar: ""
 
 # Java heap size for pilon (-Xmx)
 pilon_mem: 16G
+
+# bcftools mpileup profile: auto (ont-sup if this bcftools has it, otherwise
+# compatible -B -Q5), ont-sup, or compatible. ont-sup is tuned for SUP basecalls;
+# choose compatible for HAC/fast data if REVIEW indels look noisy.
+bcftools_profile: auto

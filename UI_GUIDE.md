@@ -212,3 +212,17 @@ BAM/BAM.BAI와 depth 파일은 크기가 클 수 있어 결과 폴더에만 보�
 python -m unittest discover -s tests -v
 bash -n run_pipeline.sh run_ui.sh launch_ui.sh install_linux_launcher.sh
 ```
+
+## 실행 중 분석 재연결 · Read QC 진단
+
+- 분석은 서버에서 브라우저와 분리되어 실행됩니다. 창을 닫거나 새로고침해도 계속되며,
+  다시 열면 "서버에서 분석이 실행 중입니다" 안내와 로그 끝부분, **완료까지 따라가기 / 이 분석 중지**
+  버튼이 표시됩니다. 실행 중에는 새 분석 실행 버튼이 잠겨 같은 분석이 중복 실행되지 않습니다.
+- 이전 세션에서 끝난 분석은 **최근 완료된 분석 결과 불러오기**로 다시 열 수 있습니다.
+- `threads × parallel_jobs`가 CPU 코어 수를 넘으면 자동으로 줄여서 실행합니다.
+- Read QC에 **Basecall model**(FASTQ header의 Dorado 모델), **Full-length reads**(reference 길이 90-110% read
+  비율), **N50 / reference**, read 길이 분포 그래프, 그리고 해석 힌트가 표시됩니다.
+  - HAC/FAST 모델이면 Mean read Q는 보통 Q15-18입니다. Q20 이상이 필요하면 POD5를 SUP 모델로 다시 basecalling하세요.
+  - N50이 reference의 80% 미만이면 DNA 절단·분해, 복수 제한효소 자리, 짧은 오염 DNA를 의심합니다.
+- Read 필터(길이/mean Q)는 `ont_ui/fastq_qc.py`가 QC와 같은 한 번의 읽기에서 수행합니다
+  (NanoFilt/chopper와 같은 mean-Q 정의, NanoFilt 결과와 동일한 출력을 확인함). NanoFilt 설치는 더 이상 필요 없습니다.

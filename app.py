@@ -30,8 +30,14 @@ from ont_ui.batch import (
     collect_batch_results,
     natural_key,
     parse_uploaded_reference,
+    active_batch_jobs,
+    completed_sample_count,
+    follow_batch_job,
+    latest_batch_job,
+    log_tail,
     prepare_batch_job,
     run_batch_job,
+    stop_batch_job,
     server_fastq_uploads,
     server_reference_uploads,
     uploaded_samples,
@@ -748,6 +754,50 @@ def _result_status_html(status: str) -> str:
     return f'<span class="{css}">{label}</span>'
 
 
+_TIER_LABEL = {"sup": "SUP", "hac": "HAC", "fast": "FAST"}
+
+
+def _render_read_diagnostics(sample: dict[str, object]) -> None:
+    """Basecall model, full-length fraction, length histogram and prep hints."""
+    model = sample.get("basecall_model")
+    tier = str(sample.get("basecall_tier") or "")
+    full_length = sample.get("full_length_read_fraction")
+    n50_ratio = sample.get("n50_to_reference")
+    cols = st.columns(3)
+    cols[0].metric("Basecall model", _TIER_LABEL.get(tier, "Unknown"), help=str(model or "FASTQ header에 모델 정보 없음"))
+    cols[1].metric(
+        "Full-length reads",
+        _percent(full_length) if full_length is not None else "N/A",
+        help="Reference 길이의 90-110%인 read 비율입니다. Whole-plasmid 데이터에서는 높아야 정상입니다.",
+    )
+    cols[2].metric(
+        "N50 / reference",
+        f"{float(n50_ratio):.0%}" if n50_ratio is not None else "N/A",
+        help="80% 미만이면 DNA 절단·분해, 복수 제한효소 자리, 짧은 오염 DNA를 의심합니다.",
+    )
+    histogram = sample.get("length_histogram")
+    if isinstance(histogram, dict) and histogram.get("counts"):
+        bin_size = int(histogram.get("bin_size", 1000))
+        counts = {int(start): int(count) for start, count in histogram["counts"].items()}
+        reference_length = int(sample.get("reference_length", 0) or 0)
+        upper = max(counts) + bin_size
+        if reference_length:
+            upper = min(upper, max(3 * reference_length, 2 * bin_size))
+        frame = pd.DataFrame(
+            {
+                "Read length (kb)": [start / 1000 for start in range(0, upper, bin_size)],
+                "Reads": [counts.get(start, 0) for start in range(0, upper, bin_size)],
+            }
+        ).set_index("Read length (kb)")
+        st.caption(
+            f"Read length distribution ({bin_size // 1000} kb bins)"
+            + (f" · reference {reference_length / 1000:.1f} kb" if reference_length else "")
+        )
+        st.bar_chart(frame, height=180)
+    for hint in sample.get("qc_hints") or []:
+        st.info(str(hint))
+
+
 def _render_batch_results(result: dict[str, object], job) -> None:
     st.divider()
     st.subheader("Batch analysis results")
@@ -875,6 +925,7 @@ def _render_batch_results(result: dict[str, object], job) -> None:
             f"Q≥20 {_percent(q20_fraction)} · "
             f"Q≥30 {_percent(q30_fraction)}"
         )
+        _render_read_diagnostics(sample)
 
         st.markdown("#### Mapping 및 mutation summary")
         qc_metrics = st.columns(4)
@@ -979,6 +1030,78 @@ def _render_batch_results(result: dict[str, object], job) -> None:
                     type="primary",
                     use_container_width=True,
                 )
+
+
+def _follow_existing_job(job) -> None:
+    """Re-attach to a batch that was started in an earlier session and wait for it."""
+    progress_box = st.empty()
+    completed = completed_sample_count(job)
+    progress_box.progress(
+        min(1.0, completed / max(1, job.sample_count)),
+        text=f"완료 {completed} / {job.sample_count} samples",
+    )
+
+    def show_line(line: str) -> None:
+        nonlocal completed
+        if " Done: " in line:
+            completed += 1
+            progress_box.progress(
+                min(1.0, completed / max(1, job.sample_count)),
+                text=f"완료 {completed} / {job.sample_count} samples",
+            )
+
+    # Replaying the log from the start re-counts finished samples.
+    completed = 0
+    try:
+        with st.spinner("실행 중인 분석을 따라가는 중… 창을 닫아도 분석은 서버에서 계속됩니다."):
+            follow_batch_job(job, on_line=show_line)
+        result = collect_batch_results(job)
+        result["audit"] = {"project_name": job.experiment_name, "user_name": "", "completed_at": "재연결된 분석"}
+        st.session_state["batch_result"] = {"job": job, "result": result}
+        progress_box.success(f"{job.sample_count} samples 분석을 완료했습니다.")
+    except BatchExecutionError:
+        st.error("분석이 실패했거나 중지되었습니다. pipeline.log를 확인하세요.")
+
+
+def _render_active_batch_jobs(jobs) -> None:
+    for job in jobs:
+        done = completed_sample_count(job)
+        st.warning(
+            f"서버에서 분석이 실행 중입니다: `{job.job_dir.name}` · 완료 {done} / {job.sample_count} samples. "
+            "브라우저를 닫거나 새로고침해도 분석은 계속됩니다. 끝날 때까지 새 분석 실행은 잠깁니다."
+        )
+        tail = log_tail(job, 12)
+        if tail:
+            st.code("\n".join(tail), language=None)
+        cols = st.columns(3)
+        if cols[0].button("진행 상황 새로고침", key=f"refresh_{job.job_dir.name}", use_container_width=True):
+            st.rerun()
+        if cols[1].button("완료까지 따라가기", key=f"follow_{job.job_dir.name}", use_container_width=True):
+            _follow_existing_job(job)
+        if cols[2].button("이 분석 중지", key=f"stop_{job.job_dir.name}", use_container_width=True):
+            if stop_batch_job(job):
+                st.info("중지 신호를 보냈습니다. 잠시 후 새로고침하세요.")
+
+
+def _offer_latest_result() -> None:
+    if st.session_state.get("batch_result"):
+        return
+    job = latest_batch_job(UI_RUN_ROOT, states=("completed",))
+    if job is None:
+        return
+    if st.button(
+        f"최근 완료된 분석 결과 불러오기 ({job.job_dir.name})",
+        key="load_latest_batch",
+        help="이전 세션에서 끝난 분석(브라우저가 닫혔던 경우 포함)의 결과를 다시 엽니다.",
+    ):
+        try:
+            result = collect_batch_results(job)
+        except (OSError, ValueError, KeyError) as exc:
+            st.error(f"결과를 불러오지 못했습니다: {exc}")
+            return
+        result["audit"] = {"project_name": job.experiment_name, "user_name": "", "completed_at": "이전 세션"}
+        st.session_state["batch_result"] = {"job": job, "result": result}
+        st.rerun()
 
 
 def _batch_ont_tab(settings: dict[str, object]) -> None:
@@ -1181,9 +1304,21 @@ def _batch_ont_tab(settings: dict[str, object]) -> None:
     )
     if mappings and (not project_name or not user_name):
         st.warning("분석을 실행하려면 Project name과 User name을 입력하세요.")
+    running_jobs = active_batch_jobs(UI_RUN_ROOT)
+    if running_jobs:
+        _render_active_batch_jobs(running_jobs)
+        can_run = False
+    else:
+        _offer_latest_result()
     depth = int(settings.get("screening_depth", BatchSettings.screening_depth))
     depth_label = f"{depth}×" if depth else "전체 reads (0)"
-    st.caption(f"이번 분석 설정 · 샘플당 {settings['threads']} threads · Screening depth {depth_label}")
+    cores = os.cpu_count() or 1
+    threads_eff = min(int(settings["threads"]), cores)
+    parallel_eff = max(1, min(int(settings["parallel_jobs"]), cores // threads_eff))
+    st.caption(
+        f"이번 분석 설정 · 샘플당 {threads_eff} threads × 동시 {parallel_eff} samples "
+        f"(CPU {cores} cores 기준 자동 제한) · Screening depth {depth_label}"
+    )
     if st.button(
         f"Batch analysis 실행 ({total_samples} samples)",
         type="primary",
