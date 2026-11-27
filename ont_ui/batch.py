@@ -164,8 +164,8 @@ def server_fastq_uploads(value: str) -> list[ServerPathUpload]:
 @dataclass(frozen=True)
 class BatchSettings:
     experiment_name: str
-    threads: int = 16
-    parallel_jobs: int = 16
+    threads: int = 0          # 0 = auto (see effective_cpu_allocation)
+    parallel_jobs: int = 0    # 0 = auto
     min_read_length: int = 500
     min_read_quality: int = 10
     min_variant_quality: float = 20.0
@@ -305,6 +305,27 @@ def _copy_upload(uploaded: object, destination: Path) -> None:
         shutil.copyfileobj(uploaded, output, length=1024 * 1024)  # type: ignore[arg-type]
 
 
+def effective_cpu_allocation(threads: int, parallel_jobs: int, samples: int) -> tuple[int, int, int]:
+    """Mirror of allocate_cpus in run_pipeline.sh: (threads, parallel_jobs, cores)."""
+    cores = max(1, os.cpu_count() or 1)
+    jobs = max(1, samples)
+    if threads <= 0 and parallel_jobs <= 0:
+        threads = min(16, max(2, cores // jobs))
+        parallel_jobs = cores // threads
+    elif threads <= 0:
+        threads = min(16, max(1, cores // min(parallel_jobs, jobs)))
+    elif parallel_jobs <= 0:
+        threads = min(threads, cores)
+        parallel_jobs = cores // threads
+    else:
+        threads = min(threads, cores)
+        if threads * parallel_jobs > cores:
+            parallel_jobs = cores // threads
+    threads = max(1, threads)
+    parallel_jobs = max(1, min(parallel_jobs, jobs))
+    return threads, parallel_jobs, cores
+
+
 def _write_config(path: Path, job: BatchJob, settings: BatchSettings) -> None:
     staged = job.job_dir / "staged"
     values: list[tuple[str, object]] = [
@@ -312,8 +333,8 @@ def _write_config(path: Path, job: BatchJob, settings: BatchSettings) -> None:
         ("data_dir", str((staged / "data").resolve())),
         ("results_dir", str((job.job_dir / "results").resolve())),
         ("minimap2_preset", "map-ont"),
-        ("threads", max(1, min(64, settings.threads))),
-        ("parallel_jobs", max(1, min(64, settings.parallel_jobs))),
+        ("threads", settings.threads if settings.threads > 0 else "auto"),
+        ("parallel_jobs", settings.parallel_jobs if settings.parallel_jobs > 0 else "auto"),
         ("min_read_length", max(0, settings.min_read_length)),
         ("min_read_quality", max(0, settings.min_read_quality)),
         ("screening_depth", max(0, settings.screening_depth)),

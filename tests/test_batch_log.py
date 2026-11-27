@@ -95,3 +95,14 @@ class BatchJobStateTests(unittest.TestCase):
             while batch_job_state(job_dir) == "running" and time.monotonic() < deadline:
                 time.sleep(0.05)
             self.assertIn(batch_job_state(job_dir), {"stopped", "failed"})
+
+
+class CpuAllocationTests(unittest.TestCase):
+    def test_auto_allocation_prefers_parallel_samples(self):
+        from unittest.mock import patch
+        from ont_ui.batch import effective_cpu_allocation
+        with patch("os.cpu_count", return_value=128):
+            self.assertEqual(effective_cpu_allocation(0, 0, 96), (2, 64, 128))
+            self.assertEqual(effective_cpu_allocation(0, 0, 5), (16, 5, 128))
+            self.assertEqual(effective_cpu_allocation(16, 16, 96), (16, 8, 128))
+            self.assertEqual(effective_cpu_allocation(4, 0, 96), (4, 32, 128))

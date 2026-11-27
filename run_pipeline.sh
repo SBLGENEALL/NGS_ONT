@@ -67,12 +67,12 @@ REF_ROOT="$(resolve_cfg_path "$(read_cfg references_dir references)")"
 DATA_ROOT="$(resolve_cfg_path "$(read_cfg data_dir data)")"
 RESULTS_ROOT="$(resolve_cfg_path "$(read_cfg results_dir results)")"
 PRESET="$(read_cfg minimap2_preset map-ont)"
-THREADS="$(read_cfg threads 16)"
+THREADS="$(read_cfg threads auto)"
 MIN_LEN="$(read_cfg min_read_length 0)"
 MIN_QUAL="$(read_cfg min_read_quality 0)"
 SCREENING_DEPTH="$(read_cfg screening_depth 100)"
 VARIANT_CALLER="$(read_cfg variant_caller bcftools)"
-PARALLEL_JOBS="$(read_cfg parallel_jobs 1)"
+PARALLEL_JOBS="$(read_cfg parallel_jobs auto)"
 PILON_JAR="$(read_cfg pilon_jar "")"
 if [[ -n "$PILON_JAR" && "$PILON_JAR" != /* ]]; then
     PILON_JAR="$SCRIPT_DIR/$PILON_JAR"
@@ -81,19 +81,11 @@ PILON_MEM="$(read_cfg pilon_mem 16G)"
 
 RUN_TIMESTAMP="$(date +%y%m%d_%H%M)"
 
-# Never oversubscribe the machine: threads x parallel_jobs <= CPU cores.
+# CPU allocation is decided after the samples are counted (see
+# allocate_cpus below). threads / parallel_jobs: a number, or 0 / auto.
 CPU_CORES="$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-REQUESTED_RESOURCES="threads=$THREADS x parallel_jobs=$PARALLEL_JOBS"
-if (( THREADS > CPU_CORES )); then THREADS=$CPU_CORES; fi
-if (( THREADS < 1 )); then THREADS=1; fi
-if (( THREADS * PARALLEL_JOBS > CPU_CORES )); then
-    PARALLEL_JOBS=$(( CPU_CORES / THREADS ))
-    if (( PARALLEL_JOBS < 1 )); then PARALLEL_JOBS=1; fi
-fi
-RESOURCE_NOTE="$CPU_CORES CPU cores"
-if [[ "$REQUESTED_RESOURCES" != "threads=$THREADS x parallel_jobs=$PARALLEL_JOBS" ]]; then
-    RESOURCE_NOTE="$CPU_CORES CPU cores; requested $REQUESTED_RESOURCES, capped"
-fi
+[[ "$THREADS" == "auto" ]] && THREADS=0
+[[ "$PARALLEL_JOBS" == "auto" ]] && PARALLEL_JOBS=0
 
 # Prefer the modern ONT SUP profile when the installed bcftools provides it.
 # The legacy `-X ont` profile contains `-I` (skip indels), so it must not be
@@ -119,8 +111,7 @@ echo " Nanopore reference-mapping pipeline"
 echo "   references  : $REF_ROOT"
 echo "   data        : $DATA_ROOT"
 echo "   results     : $RESULTS_ROOT"
-echo "   preset      : $PRESET   threads/sample: $THREADS   screening depth: $SCREENING_DEPTH   parallel samples: $PARALLEL_JOBS"
-echo "   resources   : $RESOURCE_NOTE"
+echo "   preset      : $PRESET   screening depth: $SCREENING_DEPTH   CPU cores: $CPU_CORES"
 echo "   bcftools    : $BCFTOOLS_PROFILE"
 echo "==================================================================="
 
@@ -502,9 +493,46 @@ for EXP_NAME in "${SELECTED_EXPS[@]}"; do
     done
 done
 
+# Allocate CPU cores across samples.
+#  * The slowest per-sample step (decompress + read QC) is single-threaded,
+#    and after screening the mapping step is short, so throughput comes from
+#    running many samples at once, not from many threads per sample.
+#  * auto/auto: threads = cores / samples, clamped to 2..16; parallel jobs
+#    = cores / threads (never more than the number of samples). Few samples
+#    get more threads each; a 96-sample batch runs ~cores/2 samples at once.
+#  * Explicit values are kept but never exceed the CPU core count.
+allocate_cpus() {
+    local cores=$CPU_CORES jobs=$(( JOB_COUNT > 0 ? JOB_COUNT : 1 ))
+    local req="threads=${THREADS/#0/auto} parallel_jobs=${PARALLEL_JOBS/#0/auto}"
+    if (( THREADS <= 0 && PARALLEL_JOBS <= 0 )); then
+        THREADS=$(( cores / jobs ))
+        (( THREADS > 16 )) && THREADS=16
+        (( THREADS < 2 )) && THREADS=2
+        PARALLEL_JOBS=$(( cores / THREADS ))
+    elif (( THREADS <= 0 )); then
+        THREADS=$(( cores / (PARALLEL_JOBS < jobs ? PARALLEL_JOBS : jobs) ))
+        (( THREADS > 16 )) && THREADS=16
+        (( THREADS < 1 )) && THREADS=1
+    elif (( PARALLEL_JOBS <= 0 )); then
+        (( THREADS > cores )) && THREADS=$cores
+        PARALLEL_JOBS=$(( cores / THREADS ))
+    else
+        (( THREADS > cores )) && THREADS=$cores
+        if (( THREADS * PARALLEL_JOBS > cores )); then
+            PARALLEL_JOBS=$(( cores / THREADS ))
+        fi
+    fi
+    (( THREADS < 1 )) && THREADS=1
+    (( PARALLEL_JOBS > jobs )) && PARALLEL_JOBS=$jobs
+    (( PARALLEL_JOBS < 1 )) && PARALLEL_JOBS=1
+    RESOURCE_NOTE="$cores CPU cores; requested $req -> $THREADS threads x $PARALLEL_JOBS samples at once"
+}
+allocate_cpus
+
 echo ""
 echo "==================================================================="
-echo " Running $JOB_COUNT sample(s), $PARALLEL_JOBS at a time"
+echo " Running $JOB_COUNT sample(s), $PARALLEL_JOBS at a time, $THREADS threads each"
+echo "   resources   : $RESOURCE_NOTE"
 echo "==================================================================="
 
 export SCRIPT_DIR DATA_ROOT SCREENING_DEPTH RESULTS_ROOT PRESET THREADS MIN_LEN MIN_QUAL VARIANT_CALLER BCFTOOLS_PLATFORM_MODE PILON_JAR PILON_MEM RUN_TIMESTAMP

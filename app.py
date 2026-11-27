@@ -31,6 +31,7 @@ from ont_ui.batch import (
     natural_key,
     parse_uploaded_reference,
     active_batch_jobs,
+    effective_cpu_allocation,
     completed_sample_count,
     follow_batch_job,
     latest_batch_job,
@@ -72,7 +73,7 @@ DEFAULT_ANALYSIS_SETTINGS: dict[str, dict[str, object]] = {
     "Batch analysis": {
         "experiment_name": "ONT_plasmid_batch",
         "threads": BatchSettings.threads,
-        "parallel_jobs": 16,
+        "parallel_jobs": BatchSettings.parallel_jobs,
         "screening_depth": BatchSettings.screening_depth,
         "min_length": 500,
         "min_quality": 10,
@@ -1312,12 +1313,12 @@ def _batch_ont_tab(settings: dict[str, object]) -> None:
         _offer_latest_result()
     depth = int(settings.get("screening_depth", BatchSettings.screening_depth))
     depth_label = f"{depth}×" if depth else "전체 reads (0)"
-    cores = os.cpu_count() or 1
-    threads_eff = min(int(settings["threads"]), cores)
-    parallel_eff = max(1, min(int(settings["parallel_jobs"]), cores // threads_eff))
+    threads_eff, parallel_eff, cores = effective_cpu_allocation(
+        int(settings["threads"]), int(settings["parallel_jobs"]), max(1, total_samples)
+    )
     st.caption(
         f"이번 분석 설정 · 샘플당 {threads_eff} threads × 동시 {parallel_eff} samples "
-        f"(CPU {cores} cores 기준 자동 제한) · Screening depth {depth_label}"
+        f"(CPU {cores} cores 기준) · Screening depth {depth_label}"
     )
     if st.button(
         f"Batch analysis 실행 ({total_samples} samples)",
@@ -1570,7 +1571,7 @@ def _raw_ont_tab(settings: dict[str, object]) -> None:
 
 def _restore_resource_defaults() -> None:
     current = _analysis_settings("Batch analysis")
-    for key in ("threads", "screening_depth"):
+    for key in ("threads", "parallel_jobs", "screening_depth"):
         current[key] = DEFAULT_ANALYSIS_SETTINGS["Batch analysis"][key]
         st.session_state[f"batch_resource_{key}"] = current[key]
 
@@ -1579,7 +1580,7 @@ def _settings_page() -> None:
     st.subheader("Analysis settings")
     st.caption("각 `?`에 커서를 올리면 설정 설명을 볼 수 있습니다.")
     current = _analysis_settings("Batch analysis")
-    for key in ("threads", "screening_depth"):
+    for key in ("threads", "parallel_jobs", "screening_depth"):
         default = DEFAULT_ANALYSIS_SETTINGS["Batch analysis"][key]
         st.session_state.setdefault(f"batch_resource_{key}", int(current.get(key, default)))
     with st.form("batch_settings_form"):
@@ -1593,18 +1594,19 @@ def _settings_page() -> None:
                 help="ui_runs 아래에 생성되는 결과 폴더명입니다.",
             )
             updated["threads"] = st.number_input(
-                "Threads per sample",
-                min_value=1,
-                max_value=64,
+                "Threads per sample (0 = auto)",
+                min_value=0,
+                max_value=max(1, os.cpu_count() or 1),
                 key="batch_resource_threads",
-                help="ONT sample 하나에 사용할 CPU threads입니다. 기본값은 16입니다.",
+                help="ONT sample 하나에 사용할 CPU threads입니다. 0(기본값)은 샘플 수와 CPU 코어 수로 자동 배분합니다: "
+                     "샘플이 적으면 샘플당 최대 16 threads, 많으면 2 threads씩 더 많은 샘플을 동시에 처리합니다.",
             )
             updated["parallel_jobs"] = st.number_input(
-                "Parallel samples",
-                min_value=1,
-                max_value=64,
-                value=int(current["parallel_jobs"]),
-                help="동시에 처리할 ONT sample의 최대 개수입니다.",
+                "Parallel samples (0 = auto)",
+                min_value=0,
+                max_value=max(1, os.cpu_count() or 1),
+                key="batch_resource_parallel_jobs",
+                help="동시에 처리할 ONT sample 수입니다. 0(기본값)은 CPU 코어 수 ÷ threads로 자동 설정합니다.",
             )
             updated["screening_depth"] = st.number_input(
                 "Screening depth (×, 0 = all reads)",
@@ -1666,7 +1668,7 @@ def _settings_page() -> None:
         st.session_state["saved_analysis_settings"]["Batch analysis"] = updated
         st.success("Batch settings를 저장했습니다.")
 
-    st.button("16 threads · 100× 기본값 적용", on_click=_restore_resource_defaults)
+    st.button("자동 CPU 배분 · 100× 기본값 적용", on_click=_restore_resource_defaults)
 
     st.button("← 분석 화면으로", on_click=_close_settings_page)
 
