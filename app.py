@@ -58,10 +58,10 @@ from ont_ui.basecall import (
     dorado_executable,
     gpu_devices,
     gpu_summary,
-    model_tier,
     models_root,
-    newest_model,
+    preferred_model,
     prepare_basecall_job,
+    resolve_pod5_input,
     start_basecall_job,
     stop_basecall_job,
 )
@@ -1651,66 +1651,50 @@ def _basecall_page() -> None:
                             st.info("중지 신호를 보냈습니다. 잠시 후 새로고침하세요.")
                 elif state == "completed":
                     st.success(
-                        "완료. Batch analysis에서 FASTQ 폴더로 다음 경로를 선택하세요: "
-                        f"`{Path(job.settings.output_dir) / 'fastq_pass'}`"
+                        "완료. Batch analysis의 ONT 결과 폴더 탐색에서 다음 폴더를 선택하세요: "
+                        f"`{job.settings.output_dir}`"
                     )
 
     st.markdown("#### 새 basecalling")
     if running:
         st.warning("GPU에서 basecalling이 이미 실행 중입니다. 끝난 뒤 새 작업을 시작하세요.")
-    pod5_dir = _server_folder_browser("POD5 폴더 선택", "basecall_pod5", (".pod5",))
+    picked = _server_folder_browser("ONT run 폴더 (또는 POD5 폴더) 선택", "basecall_pod5", (".pod5",))
+    pod5_dir, run_dir = resolve_pod5_input(picked) if picked else (None, None)
     pod5_count = count_pod5(pod5_dir) if pod5_dir else 0
-    if pod5_dir:
-        st.caption(f"POD5 파일 {pod5_count}개 (하위 폴더 포함)")
-    # --- Model: pick the accuracy tier; the newest version is chosen automatically.
-    tier_labels = {"sup": "SUP · 가장 정확 (권장)", "hac": "HAC · 빠름", "fast": "FAST · 가장 빠름"}
-    tiers = [tier for tier in ("sup", "hac", "fast") if newest_model(models, tier) is not None]
-    model_path = ""
-    if tiers:
-        tier = st.selectbox(
-            "Basecall 정확도", tiers, format_func=lambda t: tier_labels[t],
-            help="같은 정확도 안에서는 가장 최신 버전 모델을 자동으로 사용합니다.",
-        )
-        chosen = newest_model(models, tier)
-        with st.expander("모델 버전 직접 고르기 (선택)", expanded=False):
-            same_tier = [path.name for path in models if model_tier(path.name) == tier]
-            picked = st.selectbox("모델 버전", same_tier, index=same_tier.index(chosen.name))
-        model_path = str(models_root() / picked)
-    else:
-        st.error(f"Basecall 모델이 없습니다. 모델 폴더: `{models_root()}`")
 
-    # --- Kit: detected from the MinKNOW run files when possible.
-    detected_kit = detect_kit(pod5_dir) if pod5_dir else ""
-    kit_options = list(KITS)
-    if detected_kit and detected_kit not in kit_options:
-        kit_options.insert(0, detected_kit)
-    kit_choice = st.selectbox(
-        "Kit" + (" · run 정보에서 자동 감지됨" if detected_kit else " (필수)"),
-        kit_options,
-        index=kit_options.index(detected_kit) if detected_kit else None,
-        format_func=lambda kit: kit or "barcode 없음",
-        placeholder="시퀀싱에 사용한 kit를 선택하세요",
-        key=f"basecall_kit_{detected_kit or 'manual'}",
-        help="POD5 폴더 주변의 MinKNOW final_summary/report 파일에서 kit를 자동으로 읽습니다. "
-             "찾지 못하면 직접 선택하세요 (Native barcoding → SQK-NBD114-96, Rapid → SQK-RBK114-96).",
-    )
-    kit = kit_choice or ""
-
-    # --- Device: GPUs found by nvidia-smi.
+    # Everything else is automatic: newest SUP model, all GPUs, kit from the
+    # MinKNOW run files, output next to pod5_pass/fastq_pass in the run folder.
+    model = preferred_model(models)
+    model_path = str(model) if model else ""
     device_choices = gpu_devices()
-    device_label = st.selectbox("실행 장치", [label for label, _ in device_choices])
-    device = dict(device_choices)[device_label]
-
-    # --- Output: always a new folder next to the POD5 folder.
-    output_dir = str(default_output_dir(pod5_dir, model_path)) if pod5_dir and model_path else ""
-    if output_dir:
-        st.caption(f"결과 저장 위치 (자동): `{output_dir}/fastq_pass/barcodeNN/`")
+    device = device_choices[0][1]
+    detected_kit = detect_kit(pod5_dir) if pod5_dir else ""
+    kit_choice: str | None = detected_kit or None
+    if pod5_dir and not detected_kit:
+        kit_choice = st.selectbox(
+            "Kit (run 정보에서 찾지 못해 직접 선택)", list(KITS), index=None,
+            format_func=lambda kit: kit or "barcode 없음",
+            placeholder="시퀀싱에 사용한 kit를 선택하세요",
+            help="Native barcoding → SQK-NBD114-96, Rapid barcoding → SQK-RBK114-96",
+        )
+    kit = kit_choice or ""
+    output_dir = str(default_output_dir(run_dir, model_path)) if run_dir and model_path else ""
+    if pod5_dir:
+        summary = [
+            f"- 입력: `{pod5_dir}` (POD5 {pod5_count}개)",
+            f"- 모델: `{Path(model_path).name if model_path else '없음'}`",
+            f"- Kit: `{kit or ('barcode 없음' if kit_choice == '' else '선택 필요')}`"
+            + (" (run 정보에서 자동 감지)" if detected_kit else ""),
+            f"- 장치: {device_choices[0][0]}",
+            f"- 결과: `{output_dir}/fastq_pass/barcodeNN/`" if output_dir else "- 결과: -",
+        ]
+        st.markdown("\n".join(summary))
 
     blockers: list[str] = []
     if not dorado:
         blockers.append("Dorado 실행 파일을 찾지 못했습니다 (sidebar의 dorado 항목 확인).")
     if pod5_dir is None:
-        blockers.append("POD5 폴더로 이동한 뒤 **✓ 이 폴더 사용**을 눌러 선택하세요.")
+        blockers.append("ONT run 폴더(또는 pod5_pass 폴더)로 이동한 뒤 **✓ 이 폴더 사용**을 누르세요.")
     elif not pod5_count:
         blockers.append("선택한 폴더(하위 폴더 포함)에 .pod5 파일이 없습니다.")
     if not model_path.strip():
@@ -1878,15 +1862,19 @@ def _settings_page() -> None:
 
 def _sidebar_tool_status() -> None:
     st.markdown("##### 분석 도구")
-    for tool in ("minimap2", "samtools", "bcftools", "gzip", "bash"):
-        icon = "✅" if shutil.which(tool) else "❌"
-        st.caption(f"{icon} {tool}")
-    st.caption("✅ read QC/filter · built-in")
+    rows = [("✅" if shutil.which(tool) else "❌", tool) for tool in ("minimap2", "samtools", "bcftools", "gzip", "bash")]
+    rows.append(("✅", "read QC/filter · built-in"))
     medaka = shutil.which("medaka_variant") or shutil.which("medaka_haploid_variant")
-    st.caption(f"{'✅' if medaka else '⚪'} medaka · optional caller")
-    st.caption(f"{'✅' if dorado_executable() else '⚪'} dorado · basecalling")
+    rows.append(("✅" if medaka else "⚪", "medaka · optional caller"))
+    rows.append(("✅" if dorado_executable() else "⚪", "dorado · basecalling"))
     gpu = gpu_summary()
-    st.caption(f"{'✅' if gpu else '⚪'} GPU · {gpu.split(',')[0] if gpu else '없음'}")
+    rows.append(("✅" if gpu else "⚪", f"GPU · {gpu.split(',')[0] if gpu else '없음'}"))
+    st.markdown(
+        '<div class="sidebar-tools">'
+        + "".join(f"<div>{icon} {html.escape(label)}</div>" for icon, label in rows)
+        + "</div>",
+        unsafe_allow_html=True,
+    )
 
 def _sidebar() -> dict[str, object]:
     branding = _load_branding()
@@ -1903,7 +1891,7 @@ def _sidebar() -> dict[str, object]:
                     linear-gradient(155deg, #172EAE 0%, #4A38D0 53%, #A978EE 100%);
             }
             [data-testid="stSidebar"] [data-testid="stSidebarContent"] {
-                padding-bottom:130px;
+                padding-bottom:230px;
             }
             [data-testid="stSidebar"] h1,
             [data-testid="stSidebar"] h2,
@@ -1938,10 +1926,22 @@ def _sidebar() -> dict[str, object]:
             [data-testid="stSidebar"] [data-testid="stButton"] button[kind="primary"] p {
                 color:#2639A7;
             }
-            /* Dorado + Settings buttons follow the tool list in normal flow,
-               so a long vertical list can never slide under them. */
+            /* Dorado + Settings pinned to the bottom, directly above the
+               company logo footer (which sits at bottom:1rem, ~84px tall). */
             .st-key-sidebar_bottom_nav {
-                margin-top:0.6rem; gap:0.45rem;
+                position:fixed; left:1.5rem; bottom:7rem; width:220px;
+                z-index:1000; gap:0.45rem;
+            }
+            /* Compact tool checklist so it stays clear of the pinned buttons. */
+            .sidebar-tools div {
+                color:rgba(255,255,255,.76); font-size:0.875rem; line-height:1.85;
+            }
+            /* Very short windows: buttons and logo flow under the list
+               instead of overlapping it. */
+            @media (max-height: 700px) {
+                .st-key-sidebar_bottom_nav { position:static; width:auto; margin-top:0.8rem; }
+                .sidebar-brand-footer { position:static; width:auto; margin-top:1rem; padding:4px 0; }
+                [data-testid="stSidebar"] [data-testid="stSidebarContent"] { padding-bottom:1.5rem; }
             }
             .sidebar-brand-footer {
                 position:fixed; left:1.5rem; bottom:1rem; width:220px;

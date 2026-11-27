@@ -191,15 +191,42 @@ def count_pod5(folder: Path, recursive: bool = True) -> int:
         return 0
 
 
-def default_output_dir(pod5_dir: Path, model_path: str) -> Path:
-    tier = "sup" if "_sup@" in model_path else ("hac" if "_hac@" in model_path else "dorado")
-    stamp = datetime.now().strftime("%Y%m%d_%H%M")
-    candidate = pod5_dir.parent / f"basecall_{tier}_{stamp}"
+def resolve_pod5_input(selected: Path) -> tuple[Path, Path]:
+    """(POD5 input folder, ONT run folder) for a folder picked in the UI.
+
+    Works whether the user picks the run folder or its pod5 folder:
+      run/            -> input run/pod5_pass (or run/pod5), run folder run/
+      run/pod5_pass/  -> input run/pod5_pass, run folder run/
+    pod5_fail / pod5_skip are never included when the run folder is picked.
+    """
+    selected = Path(selected)
+    if selected.name.lower().startswith("pod5"):
+        return selected, selected.parent
+    for name in ("pod5_pass", "pod5"):
+        child = selected / name
+        if child.is_dir():
+            return child, selected
+    return selected, selected
+
+
+def default_output_dir(run_dir: Path, model_path: str) -> Path:
+    """<run>/basecall_<tier>/ next to pod5_pass and fastq_pass (unique if reused)."""
+    tier = model_tier(Path(model_path).name) or "dorado"
+    candidate = run_dir / f"basecall_{tier}"
     suffix = 2
     while candidate.exists() and any(candidate.iterdir()):
-        candidate = pod5_dir.parent / f"basecall_{tier}_{stamp}_{suffix}"
+        candidate = run_dir / f"basecall_{tier}_{suffix}"
         suffix += 1
     return candidate
+
+
+def preferred_model(models: list[Path]) -> Path | None:
+    """Newest SUP model, else newest HAC, else newest FAST."""
+    for tier in ("sup", "hac", "fast"):
+        model = newest_model(models, tier)
+        if model is not None:
+            return model
+    return None
 
 
 def _script(settings: BasecallSettings, dorado: str, job_dir: Path) -> str:

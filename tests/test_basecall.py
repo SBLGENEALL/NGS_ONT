@@ -58,8 +58,10 @@ class BasecallTests(unittest.TestCase):
             model.mkdir(parents=True)
             with patch.dict(os.environ, {"ONT_DORADO": str(dorado), "ONT_DORADO_MODELS": str(root / "models")}):
                 self.assertEqual([p.name for p in basecall.available_models()], [model.name])
-                out = basecall.default_output_dir(pod5, str(model))
-                self.assertTrue(out.name.startswith("basecall_sup_"))
+                self.assertEqual(basecall.resolve_pod5_input(pod5.parent), (pod5, pod5.parent))
+                self.assertEqual(basecall.resolve_pod5_input(pod5), (pod5, pod5.parent))
+                out = basecall.default_output_dir(pod5.parent, str(model))
+                self.assertEqual(out, pod5.parent / "basecall_sup")
                 job = basecall.prepare_basecall_job(
                     root / "runs", basecall.BasecallSettings(str(pod5), str(out), str(model))
                 )

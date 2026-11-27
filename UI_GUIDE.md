@@ -235,15 +235,16 @@ bash -n run_pipeline.sh run_ui.sh launch_ui.sh install_linux_launcher.sh
 
 ## Dorado basecalling (GPU)
 
-사이드바 **⚡ Dorado basecalling (GPU)** 화면에서 POD5를 다시 basecalling합니다.
+사이드바 하단 **⚡ Dorado basecalling (GPU)** → ONT run 폴더(또는 그 안의 `pod5_pass`)를 클릭해 선택 →
+**✓ 이 폴더 사용** → **Basecalling 시작**. 입력할 것은 없습니다.
 
-1. 인터넷 PC에서 모델 다운로드 후 서버의 모델 폴더(MinKNOW 기본 `/opt/ont/dorado-models`가 있으면 자동 사용, 없으면 `/data/dorado_models`; `ONT_DORADO_MODELS`로 변경)에 복사:
-   `dorado download --model dna_r10.4.1_e8.2_400bps_sup@v5.2.0 --models-directory <폴더>`
-2. POD5 폴더 선택 → 모델(SUP 권장) → Kit(SQK-RBK114-96 / SQK-NBD114-96 등) → **Basecalling 시작**.
-3. 결과는 `<출력 폴더>/fastq_pass/barcodeNN/*.fastq.gz`로 정리됩니다. Batch analysis에서 이 `fastq_pass` 폴더를 FASTQ로 선택하세요.
-4. 작업은 브라우저와 분리되어 실행되며, 같은 화면에서 진행 로그 확인·중지가 가능합니다. GPU 작업은 한 번에 하나만 실행합니다.
-
-Dorado 실행 파일은 PATH 또는 `ONT_DORADO`로 지정합니다. Blackwell GPU는 이를 지원하는 최신 Dorado 버전이 필요합니다.
+- 입력: run 폴더를 고르면 `pod5_pass`(없으면 `pod5`)만 사용합니다(`pod5_fail`/`pod5_skip` 제외).
+- 모델: `/opt/ont/dorado-models`(MinKNOW)의 최신 SUP 모델을 자동 사용합니다.
+- Kit: run 폴더의 MinKNOW `final_summary`/`report` 파일에서 자동 감지합니다. 못 찾을 때만 선택 창이 나옵니다.
+- 장치: 서버의 모든 GPU.
+- 결과: run 폴더 안, `pod5_pass`·`fastq_pass`와 같은 위치의 `basecall_sup/fastq_pass/barcodeNN/`.
+  Batch analysis의 ONT 결과 폴더 탐색에서 `basecall_sup` 폴더를 선택하면 SUP FASTQ로 분석합니다
+  (run 폴더를 선택하면 기존 MinKNOW `fastq_pass`가 사용됩니다).
 
 ## medaka variant caller
 
