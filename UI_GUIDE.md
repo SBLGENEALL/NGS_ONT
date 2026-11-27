@@ -119,7 +119,7 @@ ONT_UI_ADDRESS=127.0.0.1 ./run_ui.sh
    기준으로 자동 배정하지 않습니다. Reference마다 sample 수를 다르게 선택할 수 있고,
    같은 sample을 여러 Reference와 비교할 수도 있습니다. 선택하지 않은 Reference와
    ONT sample은 이번 분석에서 제외됩니다.
-5. 왼쪽 하단의 `Analysis settings` 버튼을 누르면 중앙에 나타나는 설정 화면에서
+5. 왼쪽 sidebar의 `Analysis settings` 버튼을 누르면 중앙에 나타나는 설정 화면에서
    CPU, 병렬 sample 수, read filter 및 variant review 기준을 저장할 수 있습니다.
 6. 중복·누락 경고가 없는지 확인한 뒤 `Batch analysis 실행`을 누릅니다.
 
@@ -127,8 +127,8 @@ ONT_UI_ADDRESS=127.0.0.1 ./run_ui.sh
 각각 별도의 border 영역으로 구분되어 있습니다.
 
 왼쪽 sidebar의 작은 `분석 도구` checklist에서 `minimap2`, `samtools`, `bcftools`,
-`gzip`, `bash`가 모두 ✅인지 확인할 수 있습니다. Batch QC는 설치된 `chopper`를 우선 사용하며,
-없으면 `NanoFilt`를 사용합니다. 둘 다 없으면 로그에 필터 생략을 표시합니다.
+`gzip`, `bash`가 모두 ✅인지 확인할 수 있습니다. Read QC/filter는 내장(`ont_ui/fastq_qc.py`)이라
+별도 설치가 필요 없고, medaka·dorado·GPU는 선택 항목으로 함께 표시됩니다.
 FASTQ 압축에는 `pigz`가 있으면 이를 사용하고, 없으면 `gzip`을 사용합니다. Sidebar를 접어도 화면 왼쪽 위의 화살표로 다시
 열 수 있습니다.
 
