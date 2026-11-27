@@ -1674,17 +1674,47 @@ def _basecall_page() -> None:
         )
     kit_labels = [kit or "barcode 없음" for kit in KITS]
     kit_choice = st.selectbox(
-        "Kit", kit_labels, index=0,
-        help="시퀀싱에 사용한 kit입니다. Native barcoding이면 SQK-NBD114-96, Rapid barcoding이면 SQK-RBK114-96.",
+        "Kit (필수)", kit_labels, index=None, placeholder="시퀀싱에 사용한 kit를 선택하세요",
+        help="시퀀싱에 사용한 kit입니다. Native barcoding이면 SQK-NBD114-96, Rapid barcoding이면 SQK-RBK114-96. "
+             "kit가 다르면 barcode가 잘못 분류되므로 기본값을 두지 않습니다.",
     )
-    kit = "" if kit_choice == "barcode 없음" else kit_choice
+    kit = "" if kit_choice in (None, "barcode 없음") else kit_choice
     device = st.text_input("Device", value="cuda:all", help="모든 GPU: cuda:all, 특정 GPU: cuda:0")
     suggested = str(default_output_dir(pod5_dir, model_path)) if pod5_dir and model_path else ""
     output_dir = st.text_input(
         "출력 폴더", value=suggested,
         help="기본값은 POD5 폴더 옆의 새 폴더입니다. Batch analysis 폴더 탐색기에서 보이도록 data 폴더 안에 두세요.",
     )
-    can_start = bool(dorado and pod5_dir and pod5_count and model_path and output_dir and not running)
+    output_path = Path(output_dir.strip()).expanduser() if output_dir.strip() else None
+    blockers: list[str] = []
+    if not dorado:
+        blockers.append("Dorado 실행 파일을 찾지 못했습니다 (sidebar의 dorado 항목 확인).")
+    if pod5_dir is None:
+        blockers.append("POD5 폴더로 이동한 뒤 **✓ 이 폴더 사용**을 눌러 선택하세요.")
+    elif not pod5_count:
+        blockers.append("선택한 폴더(하위 폴더 포함)에 .pod5 파일이 없습니다.")
+    if not model_path.strip():
+        blockers.append(f"Basecall 모델을 찾지 못했습니다. 모델 폴더: `{models_root()}`")
+    elif not Path(model_path.strip()).is_dir():
+        blockers.append(f"모델 폴더가 없습니다: `{model_path}`")
+    if kit_choice is None:
+        blockers.append("Kit를 선택하세요 (예: Native barcoding → SQK-NBD114-96).")
+    if output_path is None:
+        blockers.append("출력 폴더를 입력하세요.")
+    elif pod5_dir is not None and (
+        output_path.resolve() == pod5_dir.resolve() or pod5_dir.resolve() in output_path.resolve().parents
+    ):
+        blockers.append(
+            "출력 폴더는 POD5 폴더와 다른 새 폴더여야 합니다 (POD5 폴더 안이나 POD5 폴더 자체는 불가). "
+            "기본값(POD5 폴더 옆의 `basecall_sup_날짜`)을 권장합니다."
+        )
+    elif output_path.exists() and any(output_path.iterdir()):
+        blockers.append("출력 폴더가 이미 있고 비어 있지 않습니다. 새 폴더 이름을 입력하세요.")
+    if running:
+        blockers.append("다른 basecalling 작업이 실행 중입니다.")
+    if blockers:
+        st.info("Basecalling을 시작하려면 다음을 확인하세요:\n\n" + "\n".join(f"- {item}" for item in blockers))
+    can_start = not blockers
     if st.button("Basecalling 시작", type="primary", disabled=not can_start, use_container_width=True):
         try:
             job = prepare_basecall_job(

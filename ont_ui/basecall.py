@@ -84,10 +84,12 @@ def models_root() -> Path:
 def available_models(root: Path | None = None) -> list[Path]:
     """Simplex basecall model folders (dna_*) under the models root."""
     root = models_root() if root is None else root
-    if not root.is_dir():
+    try:
+        entries = list(root.iterdir()) if root.is_dir() else []
+    except OSError:
         return []
     models = [
-        path for path in root.iterdir()
+        path for path in entries
         if path.is_dir() and path.name.startswith("dna_") and "@" in path.name
         and "_mods_" not in path.name and not re.search(r"_(5mC|6mA|4mC)", path.name)
     ]
