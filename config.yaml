@@ -21,7 +21,10 @@ results_dir: results
 minimap2_preset: map-ont
 
 # Number of threads to use for minimap2 / samtools, PER SAMPLE
-threads: 4
+threads: 16
+
+# Target input depth per reference. Set to 0 to use all reads.
+screening_depth: 100
 
 # Number of samples (reference fastas) to process at the same time.
 # Each sample uses up to "threads" CPU cores, so on a high-core

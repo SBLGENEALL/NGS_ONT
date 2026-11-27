@@ -67,10 +67,10 @@ REF_ROOT="$(resolve_cfg_path "$(read_cfg references_dir references)")"
 DATA_ROOT="$(resolve_cfg_path "$(read_cfg data_dir data)")"
 RESULTS_ROOT="$(resolve_cfg_path "$(read_cfg results_dir results)")"
 PRESET="$(read_cfg minimap2_preset map-ont)"
-THREADS="$(read_cfg threads 4)"
+THREADS="$(read_cfg threads 16)"
 MIN_LEN="$(read_cfg min_read_length 0)"
 MIN_QUAL="$(read_cfg min_read_quality 0)"
-SCREENING_DEPTH="$(read_cfg screening_depth 0)"
+SCREENING_DEPTH="$(read_cfg screening_depth 100)"
 VARIANT_CALLER="$(read_cfg variant_caller bcftools)"
 PARALLEL_JOBS="$(read_cfg parallel_jobs 1)"
 PILON_JAR="$(read_cfg pilon_jar "")"
@@ -100,7 +100,7 @@ echo " Nanopore reference-mapping pipeline"
 echo "   references  : $REF_ROOT"
 echo "   data        : $DATA_ROOT"
 echo "   results     : $RESULTS_ROOT"
-echo "   preset      : $PRESET   threads/sample: $THREADS   parallel samples: $PARALLEL_JOBS"
+echo "   preset      : $PRESET   threads/sample: $THREADS   screening depth: $SCREENING_DEPTH   parallel samples: $PARALLEL_JOBS"
 echo "   bcftools    : $BCFTOOLS_PROFILE"
 echo "==================================================================="
 
@@ -253,6 +253,7 @@ process_one() {
         return 0
     fi
 
+    local started=$SECONDS after_merge after_filter after_qc after_map after_consensus after_calls
     # 1. Merge reads
     local compressor=(gzip -1c)
     if command -v pigz >/dev/null 2>&1; then
@@ -275,6 +276,7 @@ process_one() {
         echo "$LOG [1/6] Merged reads already exist, skipping"
     fi
 
+    after_merge=$SECONDS
     # 2. Optional QC filtering
     local READS_FOR_MAPPING="$MERGED_FASTQ"
     local FILTERED_FASTQ=""
@@ -305,6 +307,7 @@ process_one() {
         echo "$LOG [2/6] QC filtering disabled"
     fi
 
+    after_filter=$SECONDS
     # Persist compact read-QC metrics once so Streamlit never has to rescan a
     # large FASTQ on every page refresh.
     local FASTQ_QC_JSON="$SAMPLE_DIR/${REF_NAME}.fastq_qc.json"
@@ -340,6 +343,7 @@ process_one() {
         echo "$LOG [2/6] WARNING: Read QC summary could not be generated" >&2
     fi
 
+    after_qc=$SECONDS
     # 3. Map to reference with minimap2, sort/index with samtools
     local SORTED_BAM="$SAMPLE_DIR/${REF_NAME}.sorted.bam"
     echo "$LOG [3/6] Mapping -> $(basename "$SORTED_BAM")"
@@ -349,12 +353,14 @@ process_one() {
     samtools flagstat "$SORTED_BAM" > "$SAMPLE_DIR/${REF_NAME}.flagstat.txt"
     samtools depth -a "$SORTED_BAM" > "$SAMPLE_DIR/${REF_NAME}.depth.txt"
 
+    after_map=$SECONDS
     # 4. Raw samtools consensus: useful for ambiguous N inspection
     local SAMTOOLS_CONSENSUS_FASTA="$SAMPLE_DIR/${REF_NAME}.samtools.consensus.fasta"
     echo "$LOG [4/6] Building raw samtools consensus -> $(basename "$SAMTOOLS_CONSENSUS_FASTA")"
     samtools consensus -a -f fasta "$SORTED_BAM" > "$SAMTOOLS_CONSENSUS_FASTA"
     sed -i "1s/.*/>${REF_NAME}_samtools_consensus/" "$SAMTOOLS_CONSENSUS_FASTA"
 
+    after_consensus=$SECONDS
     # 5. Variant calling
     local VCF="$SAMPLE_DIR/${REF_NAME}.vcf.gz"
     echo "$LOG [5/6] Calling variants ($VARIANT_CALLER) -> $(basename "$VCF")"
@@ -397,6 +403,7 @@ process_one() {
         bcftools index -f "$VCF"
     fi
 
+    after_calls=$SECONDS
     # 6. Final reference-guided consensus for SnapGene/review
     #    This applies only called VCF variants to the reference. Non-variant
     #    ambiguous/homopolymer sites remain as the reference base.
@@ -410,6 +417,8 @@ process_one() {
         cp "$REF_PATH" "$FINAL_CONSENSUS_FASTA"
         sed -i "1s/.*/>${REF_NAME}/" "$FINAL_CONSENSUS_FASTA"
     fi
+
+    echo "$LOG Timing (s): merge=$((after_merge-started)) filter=$((after_filter-after_merge)) QC_and_sampling=$((after_qc-after_filter)) mapping_and_BAM=$((after_map-after_qc)) raw_consensus=$((after_consensus-after_map)) variants=$((after_calls-after_consensus)) final=$((SECONDS-after_calls))"
 
     # Per-sample summary report
     local REPORT="$SAMPLE_DIR/${REF_NAME}_report.md"

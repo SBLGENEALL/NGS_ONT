@@ -1181,6 +1181,9 @@ def _batch_ont_tab(settings: dict[str, object]) -> None:
     )
     if mappings and (not project_name or not user_name):
         st.warning("분석을 실행하려면 Project name과 User name을 입력하세요.")
+    depth = int(settings.get("screening_depth", BatchSettings.screening_depth))
+    depth_label = f"{depth}×" if depth else "전체 reads (0)"
+    st.caption(f"이번 분석 설정 · 샘플당 {settings['threads']} threads · Screening depth {depth_label}")
     if st.button(
         f"Batch analysis 실행 ({total_samples} samples)",
         type="primary",
@@ -1367,6 +1370,7 @@ def _raw_ont_tab(settings: dict[str, object]) -> None:
                 experiment_name=experiment_name,
                 sample_name=sample_name or reference.name,
                 threads=int(threads),
+                screening_depth=int(settings.get("screening_depth", BatchSettings.screening_depth)),
                 min_read_length=int(min_length),
                 min_read_quality=int(min_read_quality),
                 variant_caller=caller,
@@ -1429,10 +1433,20 @@ def _raw_ont_tab(settings: dict[str, object]) -> None:
         _render_raw_result(raw_state)
 
 
+def _restore_resource_defaults() -> None:
+    current = _analysis_settings("Batch analysis")
+    for key in ("threads", "screening_depth"):
+        current[key] = DEFAULT_ANALYSIS_SETTINGS["Batch analysis"][key]
+        st.session_state[f"batch_resource_{key}"] = current[key]
+
+
 def _settings_page() -> None:
     st.subheader("Analysis settings")
     st.caption("각 `?`에 커서를 올리면 설정 설명을 볼 수 있습니다.")
     current = _analysis_settings("Batch analysis")
+    for key in ("threads", "screening_depth"):
+        default = DEFAULT_ANALYSIS_SETTINGS["Batch analysis"][key]
+        st.session_state.setdefault(f"batch_resource_{key}", int(current.get(key, default)))
     with st.form("batch_settings_form"):
         updated: dict[str, object] = {}
         pipeline_col, threshold_col = st.columns(2)
@@ -1447,7 +1461,7 @@ def _settings_page() -> None:
                 "Threads per sample",
                 min_value=1,
                 max_value=64,
-                value=int(current["threads"]),
+                key="batch_resource_threads",
                 help="ONT sample 하나에 사용할 CPU threads입니다. 기본값은 16입니다.",
             )
             updated["parallel_jobs"] = st.number_input(
@@ -1460,7 +1474,7 @@ def _settings_page() -> None:
             updated["screening_depth"] = st.number_input(
                 "Screening depth (×, 0 = all reads)",
                 min_value=0,
-                value=int(current.get("screening_depth", BatchSettings.screening_depth)),
+                key="batch_resource_screening_depth",
                 step=100,
                 help="0은 전체 분석입니다. 양수는 QC 통과 reads에서 무작위로 뽑을 목표 입력량(×)입니다. "
                      "실제 매핑 depth는 달라질 수 있고, 저빈도 변이 검출력이 낮아질 수 있습니다.",
@@ -1516,6 +1530,8 @@ def _settings_page() -> None:
     if save_batch:
         st.session_state["saved_analysis_settings"]["Batch analysis"] = updated
         st.success("Batch settings를 저장했습니다.")
+
+    st.button("16 threads · 100× 기본값 적용", on_click=_restore_resource_defaults)
 
     st.button("← 분석 화면으로", on_click=_close_settings_page)
 

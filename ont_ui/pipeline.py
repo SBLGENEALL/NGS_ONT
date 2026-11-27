@@ -30,13 +30,14 @@ class PipelineExecutionError(RuntimeError):
 class RawAnalysisSettings:
     experiment_name: str
     sample_name: str
-    threads: int = 8
+    threads: int = 16
     min_read_length: int = 500
     min_read_quality: int = 10
     variant_caller: str = "bcftools"
     pilon_jar: str = ""
     pilon_mem: str = "16G"
     minimap2_preset: str = "map-ont"
+    screening_depth: int = 100
 
 
 @dataclass(frozen=True)
@@ -90,6 +91,7 @@ def _write_config(path: Path, job: PipelineJob, settings: RawAnalysisSettings) -
         ("minimap2_preset", settings.minimap2_preset),
         ("threads", max(1, settings.threads)),
         ("parallel_jobs", 1),
+        ("screening_depth", max(0, settings.screening_depth)),
         ("min_read_length", max(0, settings.min_read_length)),
         ("min_read_quality", max(0, settings.min_read_quality)),
         ("variant_caller", settings.variant_caller),

@@ -41,6 +41,8 @@ class PipelineStagingTests(unittest.TestCase):
             self.assertTrue(staged[0].is_symlink())
             config = job.config_path.read_text(encoding="utf-8")
             self.assertIn(str(job.references_root.resolve()), config)
+            self.assertIn("threads: 16\n", config)
+            self.assertIn("screening_depth: 100\n", config)
             self.assertIn("min_read_length: 500", config)
             self.assertIn("min_read_quality: 10", config)
 
