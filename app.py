@@ -1840,15 +1840,18 @@ def _settings_page() -> None:
 def _sidebar_tool_status() -> None:
     st.markdown("##### 분석 도구")
     required = ("minimap2", "samtools", "bcftools", "gzip", "bash")
-    for tool in required:
-        icon = "✅" if shutil.which(tool) else "❌"
-        st.caption(f"{icon} {tool}")
-    st.caption("✅ read QC/filter · built-in")
+    missing = [tool for tool in required if not shutil.which(tool)]
+    if missing:
+        st.caption("❌ 없음: " + ", ".join(missing))
+    else:
+        st.caption("✅ " + " · ".join(required))
     medaka = shutil.which("medaka_variant") or shutil.which("medaka_haploid_variant")
-    st.caption(f"{'✅' if medaka else '⚪'} medaka · optional caller")
-    st.caption(f"{'✅' if dorado_executable() else '⚪'} dorado · basecalling")
     gpu = gpu_summary()
-    st.caption(f"{'✅' if gpu else '⚪'} GPU · {gpu.split(',')[0] if gpu else '없음'}")
+    st.caption(
+        f"{'✅' if medaka else '⚪'} medaka · "
+        f"{'✅' if dorado_executable() else '⚪'} dorado · "
+        f"{'✅ GPU' if gpu else '⚪ GPU 없음'}"
+    )
 
 def _sidebar() -> dict[str, object]:
     branding = _load_branding()
@@ -1865,7 +1868,7 @@ def _sidebar() -> dict[str, object]:
                     linear-gradient(155deg, #172EAE 0%, #4A38D0 53%, #A978EE 100%);
             }
             [data-testid="stSidebar"] [data-testid="stSidebarContent"] {
-                padding-bottom:210px;
+                padding-bottom:260px;
             }
             [data-testid="stSidebar"] h1,
             [data-testid="stSidebar"] h2,
@@ -1900,9 +1903,10 @@ def _sidebar() -> dict[str, object]:
             [data-testid="stSidebar"] [data-testid="stButton"] button[kind="primary"] p {
                 color:#2639A7;
             }
-            [data-testid="stSidebar"] [data-testid="stButton"]:has(button[kind="secondary"]) {
+            /* Bottom navigation (Dorado + Settings) stacked above the logo. */
+            .st-key-sidebar_bottom_nav {
                 position:fixed; left:1.5rem; bottom:6.6rem; width:220px;
-                z-index:1000;
+                z-index:1000; gap:0.45rem;
             }
             .sidebar-brand-footer {
                 position:fixed; left:1.5rem; bottom:1rem; width:220px;
@@ -1938,20 +1942,21 @@ def _sidebar() -> dict[str, object]:
         )
         _sidebar_tool_status()
 
-        st.button(
-            "⚡ Dorado basecalling (GPU)",
-            type="secondary",
-            use_container_width=True,
-            on_click=_open_basecall_page,
-            help="POD5를 Dorado SUP 모델로 다시 basecalling하고 barcode별 FASTQ로 정리합니다.",
-        )
-        st.button(
-            "⚙ Analysis settings",
-            type="secondary",
-            use_container_width=True,
-            on_click=_open_settings_page,
-            help="선택한 분석의 설정을 가운데 화면에서 변경합니다.",
-        )
+        with st.container(key="sidebar_bottom_nav"):
+            st.button(
+                "⚡ Dorado basecalling (GPU)",
+                type="secondary",
+                use_container_width=True,
+                on_click=_open_basecall_page,
+                help="POD5를 Dorado SUP 모델로 다시 basecalling하고 barcode별 FASTQ로 정리합니다.",
+            )
+            st.button(
+                "⚙ Analysis settings",
+                type="secondary",
+                use_container_width=True,
+                on_click=_open_settings_page,
+                help="선택한 분석의 설정을 가운데 화면에서 변경합니다.",
+            )
         st.markdown(
             (
                 '<div class="sidebar-brand-footer">'
